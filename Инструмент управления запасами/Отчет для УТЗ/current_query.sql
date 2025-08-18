@@ -260,8 +260,10 @@ GROUP BY am.mp, am.seller, am.sku, am.article_1c, am.code_1c, am.cluster_to, exc
 --Усеченная версия для УТЗ
 SELECT
     sb.name as name,
+    sb.brand as brand,
     am.article_1c as article_1c,
     am.code_1c as code_1c,
+    rd.size as size,
     warehouse_code,
     ROUND(SUM(avg_quantity_orders_full) OVER (PARTITION BY article_1c, code_1c)) AS avg_quantity_orders_full_total,
     ROUND(SUM(avg_quantity_orders) OVER (PARTITION BY article_1c, code_1c)) AS avg_quantity_orders_total,
@@ -291,5 +293,6 @@ FROM final_full am
 LEFT JOIN import AS im ON am.article_1c=im.article_1c AND am.code_1c=im.code_1c
 LEFT JOIN final_exclude oos ON am.mp=oos.mp AND am.seller=oos.seller AND am.sku=oos.sku AND am.article_1c=oos.article_1c AND am.code_1c=oos.code_1c AND am.cluster_to=oos.cluster_to
 LEFT JOIN (SELECT DISTINCT name, article_1c, code_1c, brand, discounted, warehouse_code  FROM ref.article_mp) sb ON am.article_1c=sb.article_1c AND am.code_1c=sb.code_1c
+LEFT JOIN (SELECT DISTINCT article_1c, sku, seller, mp, mark_mp as size FROM ref.dimensions) rd ON am.article_1c=rd.article_1c AND am.sku=rd.sku AND am.seller=rd.seller AND am.mp=rd.mp
 WHERE brand != 'РЕСЕЙЛ' AND discounted != 1
 ORDER BY am.article_1c, am.mp, am.seller, am.cluster_to
