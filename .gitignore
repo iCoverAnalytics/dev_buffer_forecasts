@@ -1,6 +1,8 @@
 # Custom
 .vscode
-data/
+Инструмент управления запасами/Моделирование на Python/data/out
+Инструмент управления запасами/Моделирование на Python/draft*
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
