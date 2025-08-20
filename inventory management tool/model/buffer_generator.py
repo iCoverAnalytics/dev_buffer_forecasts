@@ -84,6 +84,7 @@ PARAMS = {
     'min_cluster_m3': 8,          # минимальный объем товаров на кластер
     'min_good': 3,                # минимальное количество товаров на поставку
     'min_cluster_limit': 6,       # добавлено потом: максимальный объем, при котором все равно грузим последнюю машину
+    'RECALC_COOLDOWN_DAYS': 3,    # пересчет не чаще, чем (кроме красной кнопки)
     # --- ДУБ / ЕГОРОВ: ОКНО НАБЛЮДЕНИЯ ---
     'M_RT': 4,                    # множитель к RT: окно = RT * M_RT (на каждый ключ)
     'UP_STEP': 0.3333,            # шаг увеличения BT (+33.3%)
@@ -137,6 +138,7 @@ for date in date_range:
             {PARAMS['GREEN_SHARE_DOWN']}    AS GREEN_SHARE_DOWN,    -- мин. доля дней с зоной в окне
             {PARAMS['REQUIRE_COVERAGE']}    AS REQUIRE_COVERAGE,    -- мин. доля дней с зоной в окне
             {PARAMS['FAST_RED_STREAK']}     AS FAST_RED_STREAK,     -- быстрый триггер: N последних дней красные
+            {PARAMS['RECALC_COOLDOWN_DAYS']} AS RECALC_COOLDOWN_DAYS,
             {PARAMS['id_ver']}              AS CUR_VER
 
         /* ---------- 1) Кандидаты: строго по PERIOD (Далее будет по Товарной матрице) ---------- */
@@ -191,6 +193,20 @@ for date in date_range:
             WHERE date = toDate('{START_DATE}') - INTERVAL 1 DAY
             AND id_ver = CUR_VER
             GROUP BY mp, seller, sku, article_1c, code_1c, cluster_to
+        )
+
+        , supplies_within_rt_keys AS (
+            SELECT
+                s.mp as mp, s.seller as seller, s.sku as sku, s.article_1c as article_1c, s.code_1c as code_1c, s.cluster_to as cluster_to,
+                SUM(s.quantity_supplies) AS quantity_supplies_within_rt
+            FROM sb.buffer_supplies s
+            INNER JOIN keys_today kt
+                USING (mp, seller, sku, article_1c, code_1c, cluster_to)
+            WHERE s.id_ver = toString(CUR_VER)
+            /* поставки, чей closing_date попадает в (D; D+RT] */
+            AND s.closing_date >  toDate('{START_DATE}')
+            AND s.closing_date <= addDays(toDate('{START_DATE}'), RT_DEFAULT)
+            GROUP BY s.mp, s.seller, s.sku, s.article_1c, s.code_1c, s.cluster_to
         )
 
         /* ---------- 2) Окно ДУБ: необходимо в отдельном CTE, т.к. дальше будет разное кол-во дней окна на разные ключи ---------- */
@@ -306,13 +322,33 @@ for date in date_range:
             kt.code_1c AS code_1c, 
             kt.cluster_to AS cluster_to,
 
+            /* action_suggested без фикса поставок */
             multiIf(
-            cv.has_coverage = 0,                                 'HOLD',
-            ifNull(ft.fast_red_all_lastN, 0) = 1,                'UP',
-            cv.red_days >= cv.red_threshold,                     'UP',
-            (cv.breach_days = 0 AND cv.red_days = 0
-                AND cv.green_days >= cv.green_threshold),         'DOWN',
-                                                                'HOLD'
+                cv.has_coverage = 0,                                  'HOLD',
+                ifNull(ft.fast_red_all_lastN, 0) = 1,                 'UP',
+                cv.red_days >= cv.red_threshold,                      'UP',
+                (cv.breach_days = 0 AND cv.red_days = 0
+                    AND cv.green_days >= cv.green_threshold),         'DOWN',
+                                                                    'HOLD'
+            ) AS action_raw,
+
+            /* итоговое действие с предохранителями */
+            multiIf(
+                -- 1) есть поставки в пределах RT → удерживаем вместо UP
+                (action_raw = 'UP' AND ifNull(swk.quantity_supplies_within_rt, 0) > 0), 'HOLD',
+
+                -- 2) кулдаун < RECALC_COOLDOWN_DAYS с последнего изменения буфера
+                (action_raw IN ('UP','DOWN'))
+                AND (ifNull(p.new_buffer_prev, 9999) < toUInt32(RECALC_COOLDOWN_DAYS))
+                AND NOT (action_raw = 'UP' AND (
+                            ifNull(ft.fast_red_all_lastN, 0) = 1
+                            OR cv.breach_days > 0
+                            OR cv.red_days >= cv.red_threshold
+                        )),
+                'HOLD',
+
+                -- else
+                action_raw
             ) AS action_suggested,
 
             /* приоритет: нет истории → first_init; есть сигнал → recalc; иначе simulate */
@@ -342,9 +378,13 @@ for date in date_range:
         LEFT JOIN fast_tail AS ft
         USING (mp, seller, sku, article_1c, code_1c, cluster_to)
 
+        LEFT JOIN supplies_within_rt_keys swk
+        USING (mp, seller, sku, article_1c, code_1c, cluster_to)
+
+
         GROUP BY
             date, mp, seller, sku, article_1c, code_1c, cluster_to,
-            action_suggested, calc_type,
+            action_suggested, calc_type, cv.has_coverage, ft.fast_red_all_lastN, cv.red_days, cv.red_threshold, cv.breach_days, cv.green_days, cv.green_threshold,
             new_buffer_prev, is_first_day, is_recalc_day, id_ver
             '''     
     df_keys = ch_object.extract_data(query_keys)
@@ -363,7 +403,7 @@ for date in date_range:
         toFloat64({PARAMS['BAD_PRICE_LOW']})      AS BAD_PRICE_LOW,
         toFloat64({PARAMS['BAD_PRICE_HIGH']})     AS BAD_PRICE_HIGH,
         toFloat64({PARAMS['MAX_EXCLUDED_SHARE']}) AS MAX_EXCLUDED_SHARE,
-        toInt32({PARAMS['AVG_DAYS_CONST']})       AS AVG_DAYS_CONST,
+        toInt32({PARAMS['AVG_DAYS_CONST']})       AS RT_DEFAULT,
         toInt32({PARAMS['INS_CONST']})            AS INS_CONST,
         toInt32({PARAMS['AVG_DAYS_CONST']}) * toInt32({PARAMS['M_RT']})       AS BUF_NORM_CONST,
         toInt32({PARAMS['id_ver']})               AS CUR_VER
@@ -393,7 +433,7 @@ for date in date_range:
         WHERE id_ver = toString(CUR_VER)
         /* включительно по RT, строго после текущей даты */
         AND closing_date >  toDate('{START_DATE}')
-        AND closing_date <= addDays(toDate('{START_DATE}'), AVG_DAYS_CONST)
+        AND closing_date <= addDays(toDate('{START_DATE}'), RT_DEFAULT)
         GROUP BY mp, seller, sku, article_1c, code_1c, cluster_to
     )
 
@@ -574,8 +614,8 @@ for date in date_range:
             smp.quantity_stocks_full,
             src.quantity_stocks_main,
             src.quantity_stocks_main_full,
-            sup.quantity_supplies,              -- все «в пути»
-            swr.quantity_supplies_within_rt,    -- ← новый: только в пределах RT
+            sup.quantity_supplies,            
+            swr.quantity_supplies_within_rt,    
             bp.bp_quantity_orders,
             MAX(am.quantity_orders) AS max_quantity_order,
             MIN(am.quantity_orders) AS min_quantity_order,
@@ -642,7 +682,7 @@ for date in date_range:
         days_oos_number                   AS days_oos_number,
         days_bp_number                    AS days_bp_number,
 
-        AVG_DAYS_CONST                    AS avg_day_to_cluster,
+        RT_DEFAULT                        AS avg_day_to_cluster,
         INS_CONST                         AS insurance_reserv_cluster,
         BUF_NORM_CONST                    AS buffer_cluster_norm,
 
@@ -694,7 +734,7 @@ for date in date_range:
     query_sim  = f'''
     /* ---- simulate_day ---- */
     WITH
-        toInt32({PARAMS['AVG_DAYS_CONST']})       AS AVG_DAYS_CONST,
+        toInt32({PARAMS['AVG_DAYS_CONST']})       AS RT_DEFAULT,
         toInt32({PARAMS['id_ver']})               AS CUR_VER
 
     /* ключи для simulate_day */
@@ -790,7 +830,7 @@ for date in date_range:
         USING (mp, seller, sku, article_1c, code_1c, cluster_to)
     WHERE s.id_ver = toString(CUR_VER)
       AND s.closing_date >  toDate('{START_DATE}')
-      AND s.closing_date <= addDays(toDate('{START_DATE}'), AVG_DAYS_CONST)  -- включительно по RT
+      AND s.closing_date <= addDays(toDate('{START_DATE}'), RT_DEFAULT)  -- включительно по RT
     GROUP BY s.mp, s.seller, s.sku, s.article_1c, s.code_1c, s.cluster_to
     )
 
@@ -881,7 +921,8 @@ for date in date_range:
         toInt32({PARAMS['id_ver']})        AS CUR_VER,
         toFloat64({PARAMS['UP_STEP']})     AS UP_STEP,
         toFloat64({PARAMS['DOWN_STEP']})   AS DOWN_STEP,
-        toInt32({PARAMS['AVG_DAYS_CONST']}) AS AVG_DAYS_CONST
+        toFloat64({PARAMS['REQUIRE_COVERAGE']}) AS REQUIRE_COVERAGE,
+        toInt32({PARAMS['AVG_DAYS_CONST']}) AS RT_DEFAULT
 
 
     , key_list_recalc AS (
@@ -971,7 +1012,7 @@ for date in date_range:
             USING (mp, seller, sku, article_1c, code_1c, cluster_to)
         WHERE s.id_ver = toString(CUR_VER)
         AND s.closing_date >  toDate('{START_DATE}')
-        AND s.closing_date <= addDays(toDate('{START_DATE}'), AVG_DAYS_CONST)
+        AND s.closing_date <= addDays(toDate('{START_DATE}'), RT_DEFAULT)
         GROUP BY s.mp, s.seller, s.sku, s.article_1c, s.code_1c, s.cluster_to
     )
 
@@ -1004,15 +1045,60 @@ for date in date_range:
         LEFT JOIN orders_today_raw ot USING (mp, seller, sku, article_1c, code_1c, cluster_to)
     )
 
+    , win_floor AS (
+        SELECT
+            mp, seller, sku, article_1c, code_1c, cluster_to,
+            addDays(toDate('{START_DATE}') - 1, -(RT_DEFAULT * 4) + 1) AS w_start,
+            toDate('{START_DATE}') - 1 AS w_end
+        FROM key_list_recalc
+    )
+
+    , avg_orders AS (
+    SELECT
+        bm.mp as mp, bm.seller as seller, bm.sku as sku, bm.article_1c as article_1c, bm.code_1c as code_1c, bm.cluster_to as cluster_to,
+        SUM(bm.quantity_orders) AS sum_orders,
+        countDistinct(bm.date)  AS days_obs,
+        SUM(bm.quantity_orders) / NULLIF(countDistinct(bm.date), 0) AS avg_daily_orders
+    FROM sb.buffer_main bm
+    INNER JOIN win_floor wf
+        ON  bm.mp = wf.mp AND bm.seller = wf.seller AND bm.sku = wf.sku
+        AND bm.article_1c = wf.article_1c AND bm.code_1c = wf.code_1c
+        AND bm.cluster_to = wf.cluster_to
+    WHERE bm.id_ver = CUR_VER
+      AND bm.date BETWEEN wf.w_start AND wf.w_end
+    GROUP BY bm.mp, bm.seller, bm.sku, bm.article_1c, bm.code_1c, bm.cluster_to
+    )
+
+    , buffer_floor AS (
+    SELECT
+        ps.mp as mp, ps.seller as seller, ps.sku as sku, ps.article_1c as article_1c, ps.code_1c as code_1c, ps.cluster_to as cluster_to,
+        greatest(
+            toFloat64(1),
+            toFloat64(RT_DEFAULT * 2) *
+            if(
+                ifNull(ao.days_obs, 0) >= toUInt32(round(RT_DEFAULT * 4 * REQUIRE_COVERAGE)),
+                ifNull(ao.avg_daily_orders, 0),
+                0
+            )
+        ) AS floor_val
+    FROM prev_state ps
+    LEFT JOIN avg_orders ao
+      USING (mp, seller, sku, article_1c, code_1c, cluster_to)
+    )
+
+
     , buffer_new AS (
         SELECT
-            ps.mp, ps.seller, ps.sku, ps.article_1c, ps.code_1c, ps.cluster_to,
+            ps.mp as mp, ps.seller as seller, ps.sku as sku, ps.article_1c as article_1c, ps.code_1c as code_1c, ps.cluster_to as cluster_to,
             ROUND(
-                toFloat64(ps.buffer_cluster_prev) * ifNull(ffa.factor_final, 1.0)
+                greatest(
+                    toFloat64(ps.buffer_cluster_prev) * ifNull(ffa.factor_final, 1.0),
+                    bf.floor_val
+                )
             ) AS buffer_cluster_new
         FROM prev_state ps
-        LEFT JOIN factor_from_action ffa
-            USING (mp, seller, sku, article_1c, code_1c, cluster_to)
+        LEFT JOIN factor_from_action ffa USING (mp, seller, sku, article_1c, code_1c, cluster_to)
+        LEFT JOIN buffer_floor bf       USING (mp, seller, sku, article_1c, code_1c, cluster_to)
     )
 
     /* ФИНАЛ */
