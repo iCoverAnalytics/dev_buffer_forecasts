@@ -109,6 +109,17 @@ PARAMS = {
     # 'SUSPEND_AUTORELEASE_DAYS': 3,
 }
 
+query_volumes = """
+    SELECT DISTINCT article_1c, code_1c, mp, seller, volume_m3 
+    FROM ref.article_mp
+    WHERE volume_m3 != ''
+"""
+volumes = ch_object.extract_data(query=query_volumes)
+
+volumes = volumes.astype({'volume_m3': 'float'})
+volumes.info()
+
+
 date_range = pd.date_range(start='2025-02-01', end='2025-05-01')
 
 for date in date_range:
@@ -116,6 +127,7 @@ for date in date_range:
     START_DATE = date.strftime('%Y-%m-%d')
     print(START_DATE)
 
+    print('query_keys')
     query_keys  = f'''
     /* ===================== ПАРАМЕТРЫ ===================== */
         WITH
@@ -330,9 +342,7 @@ for date in date_range:
             action_suggested, calc_type,
             new_buffer_prev, is_first_day, is_recalc_day, id_ver
             '''     
-
     df_keys = ch_object.extract_data(query_keys)
-
     df_keys, other_column_list = preprocess_data(df=df_keys, column_types=TYPES_KEYS, add_missed_columns=False, handle_invalid_values=False)
     ch_object.execute_query(query=f'''DELETE FROM sb.buffer_calc_keys WHERE id_ver = toInt32({PARAMS['id_ver']}) AND date = '{START_DATE}'  ''')
     ch_object.insert_data(table_name='sb.buffer_calc_keys', df=df_keys)
@@ -340,7 +350,7 @@ for date in date_range:
 
     ch_object.execute_query(query=f'''DELETE FROM sb.buffer_main WHERE id_ver = {PARAMS['id_ver']} AND date = '{START_DATE}'  ''')
     # Инициация буфера (first_init)
-
+    print('query_init')
     query_init  = f'''
     WITH
         toInt32({PARAMS['PERIOD']})               AS PERIOD,
@@ -670,22 +680,15 @@ for date in date_range:
 
     '''
     df_init = ch_object.extract_data(query_init)
-
     df_init, other_column_list = preprocess_data(df=df_init, column_types=TYPES, add_missed_columns=False, handle_invalid_values=False)
     ch_object.insert_data(table_name='sb.buffer_main', df=df_init)
-    # Симуляция
 
+    # Симуляция
+    print('query_sim')
     query_sim  = f'''
     /* ---- simulate_day ---- */
     WITH
-        toInt32({PARAMS['PERIOD']})               AS PERIOD,
-        toFloat64({PARAMS['OOS_RATIO']})          AS OOS_RATIO,
-        toFloat64({PARAMS['BAD_PRICE_LOW']})      AS BAD_PRICE_LOW,
-        toFloat64({PARAMS['BAD_PRICE_HIGH']})     AS BAD_PRICE_HIGH,
-        toFloat64({PARAMS['MAX_EXCLUDED_SHARE']}) AS MAX_EXCLUDED_SHARE,
         toInt32({PARAMS['AVG_DAYS_CONST']})       AS AVG_DAYS_CONST,
-        toInt32({PARAMS['INS_CONST']})            AS INS_CONST,
-        toInt32({PARAMS['BUF_NORM_CONST']})       AS BUF_NORM_CONST,
         toInt32({PARAMS['id_ver']})               AS CUR_VER
 
     /* ключи для simulate_day */
@@ -788,14 +791,14 @@ for date in date_range:
     /* моделируем запас на день D: stock_today = max(0, stock_prev - sales_prev + supplies_arrive_today) */
     , stocks_sim_today AS (
         SELECT
-            cb.mp, cb.seller, cb.sku, cb.article_1c, cb.code_1c, cb.cluster_to,
+            cb.mp as mp, cb.seller as seller, cb.sku as sku, cb.article_1c as article_1c, cb.code_1c as code_1c, cb.cluster_to as cluster_to,
             GREATEST(
                 0,
                 ROUND( cb.quantity_stocks_prev - cb.quantity_orders_prev + IFNULL(sa.quantity_supplies_arrive, 0) )
             ) AS quantity_stocks
         FROM current_buffer cb
         LEFT JOIN supplies_arrive_today sa
-            USING (mp, seller, article_1c, code_1c, cluster_to)
+            USING (mp, seller, sku, article_1c, code_1c, cluster_to)
     )
 
     /* ФИНАЛ */
@@ -861,11 +864,10 @@ for date in date_range:
 
     '''
     df_sim = ch_object.extract_data(query_sim)
-
     df_sim, other_column_list = preprocess_data(df=df_sim, column_types=TYPES, add_missed_columns=True, handle_invalid_values=False)
     ch_object.insert_data(table_name='sb.buffer_main', df=df_sim)
 
-    # RECALC_DAY
+    print('query_recalc')
     query_recalc  = f'''
     /* ---- recalc_day (DBR/TOC) — устойчивый к пустому окну ---- */
     WITH
@@ -1077,14 +1079,12 @@ for date in date_range:
         WHERE discounted != 1 AND brand != 'РЕСЕЙЛ'
     ) r USING (article_1c, code_1c)
     '''
-
     df_recalc = ch_object.extract_data(query_recalc)
-
     df_recalc, other_column_list = preprocess_data(df=df_recalc, column_types=TYPES, add_missed_columns=True, handle_invalid_values=False)
     ch_object.insert_data(table_name='sb.buffer_main', df=df_recalc)
 
 
-
+    print('extract_by_theory - первый запрос для поставок')
     extract_by_theory = f"""
         SELECT *
         FROM sb.buffer_main
@@ -1103,17 +1103,6 @@ for date in date_range:
     len(buffer_main)
 
 
-    query_volumes = """
-        SELECT DISTINCT article_1c, code_1c, mp, seller, volume_m3 
-        FROM ref.article_mp
-        WHERE volume_m3 != ''
-    """
-    volumes = ch_object.extract_data(query=query_volumes)
-
-    volumes = volumes.astype({'volume_m3': 'float'})
-    volumes.info()
-
-
 
     min_cluster_m3 = PARAMS['min_cluster_m3'] 
     min_good = PARAMS['min_good'] 
@@ -1125,7 +1114,7 @@ for date in date_range:
     merged_df['volume_requirement'] = merged_df['deliveries_to_cluster'] * merged_df['volume_m3']
 
     empty_vol = merged_df[merged_df['volume_m3'].isna()]
-    print(f'Количество строк с пустым объемом: {len(empty_vol)}')
+    # print(f'Количество строк с пустым объемом: {len(empty_vol)}')
     if len(empty_vol):
         empty_vol.head()
 
@@ -1137,19 +1126,19 @@ for date in date_range:
 
     # находим максимально необходимое количество машин по каждой поставке 
     for wh, wh_items in df.groupby(by=['mp', 'seller', 'cluster_to']): #.query('(cluster_to == "Приволжский федеральный округ") & (seller == "Ридберг")')
-        print(wh)
+        # print(wh)
         # Рандомим дату отправки и дату прибытия
         # shipping_date = datetime.today() + timedelta(days=random.randint(5, 20))
         # closing_date = wh_items['date'] + timedelta(days=random.randint(7, 10))
 
         total_vol = wh_items['volume_requirement'].sum() # объем поставки
-        print(f"объем поставки: {total_vol}")
+        # print(f"объем поставки: {total_vol}")
         if total_vol < min_cluster_limit:
-            print(f"поставка меньше 8 м куб - не едет")
+            # print(f"поставка меньше 8 м куб - не едет")
             continue # поставка меньше 8 м куб - не едет
 
         truck_count = int(math.floor(total_vol / min_cluster_m3)) # кол-во машин по 8 м3
-        print(f"Количество целых заполненных машин: {truck_count}")
+        # print(f"Количество целых заполненных машин: {truck_count}")
         # if truck_count == 0:
         #     continue  # не должно случиться, но пусть будет
 
@@ -1159,12 +1148,12 @@ for date in date_range:
         # Сделаем проверку, что последняя машина не должна быть заполнениться меньше, чем 8 кубов, 
         # иначе можно грузить, не заполняя последнюю машину полностью
         if total_vol - full_vol >= PARAMS['min_cluster_limit']: # остаток свободного места меньше, чем 2 куба
-            print(f"Последняя машина заполняется на {total_vol - full_vol} что >= {PARAMS['min_cluster_limit']} остаток свободного места меньше, чем 2 куба, можно грузить, не заполняя последнюю машину полностью")
+            # print(f"Последняя машина заполняется на {total_vol - full_vol} что >= {PARAMS['min_cluster_limit']} остаток свободного места меньше, чем 2 куба, можно грузить, не заполняя последнюю машину полностью")
             full_vol = total_vol 
 
         # объём, оставшийся в текущей машине (да, я создаю 100500 объектов, и что. Потом оптимизирую)
         free_left = full_vol
-        print(f"Объем итоговый поставки: {free_left}")
+        # print(f"Объем итоговый поставки: {free_left}")
 
         # Идём по товарам в порядке убывания приоритета (нашего светофора)
         for _, row in wh_items.sort_values('buffer_cluster_marker', ascending=False).iterrows():
