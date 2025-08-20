@@ -12,6 +12,21 @@ from ConnectingOperator import ClickHouseConnector
 from preprocess_data_2 import preprocess_data # type: ignore
 ch_object = ClickHouseConnector(task_id='my_buffers', local_run=True)
 
+TYPES_KEYS = {
+        'date': 'datetime64[ns]',
+        'mp': 'string',
+        'seller': 'string',
+        'sku': 'string',
+        'article_1c': 'string',
+        'code_1c': 'string',
+        'cluster_to': 'string',
+        'calc_type': 'string',
+        'new_buffer_prev': 'int64',
+        'is_first_day':'int64',
+        'is_recalc_day':'int64',
+        'id_ver': 'int64'
+}
+
 TYPES = {
     'id_ver': 'int64',
     'date': 'datetime64[ns]',
@@ -41,17 +56,17 @@ TYPES = {
 }
 
 TYPES_SUP = {
-        'id_ver': 'str',
-        'supply_id': 'str',
+        'id_ver': 'string',
+        'supply_id': 'string',
         'shipping_date': 'datetime64[ns]',
         'closing_date': 'datetime64[ns]',
-        'article_1c': 'str',
-        'code_1c': 'str',
-        'mp': 'str',
-        'seller': 'str',
-        'sku': 'str',
-        'cluster_to':'str',
-        'quantity_supplies': 'int'
+        'article_1c': 'string',
+        'code_1c': 'string',
+        'mp': 'string',
+        'seller': 'string',
+        'sku': 'string',
+        'cluster_to':'string',
+        'quantity_supplies': 'int64'
 }
 
 PARAMS = {
@@ -99,9 +114,8 @@ for date in date_range:
 
     query_keys  = f'''
     /* ===================== ПАРАМЕТРЫ ===================== */
-    query_keys = f"""
         WITH
-            {PARAMS['PERIOD']}         AS PERIOD,           -- как у тебя: пул ключей из продаж/остатков
+            {PARAMS['PERIOD']}         AS PERIOD,           -- интервал для выбора ключей из заказов
             {PARAMS['AVG_DAYS_CONST']} AS RT_DEFAULT,       -- дефолтный RT (дни) пока нет фактического
             {PARAMS['M_RT']}           AS M_RT,             -- множитель RT (окно = RT * M_RT)
             {PARAMS['REQUIRE_COVERAGE']} AS REQUIRE_COVERAGE,  -- мин. доля дней с зоной в окне
@@ -187,7 +201,7 @@ for date in date_range:
                 AND bm.article_1c = w.article_1c AND bm.code_1c = w.code_1c
                 AND bm.cluster_to = w.cluster_to
                 AND bm.id_ver = CUR_VER
-                AND bm.date BETWEEN w.window_start AND w.window_end
+            WHERE bm.date BETWEEN w.window_start AND w.window_end
             GROUP BY bm.mp, bm.seller, bm.sku, bm.article_1c, bm.code_1c, bm.cluster_to, bm.date
         )
 
@@ -230,7 +244,7 @@ for date in date_range:
                 ON  dsz.mp = w.mp AND dsz.seller = w.seller AND dsz.sku = w.sku
                 AND dsz.article_1c = w.article_1c AND dsz.code_1c = w.code_1c
                 AND dsz.cluster_to = w.cluster_to
-                AND dsz.date BETWEEN w.window_start AND w.window_end
+            WHERE dsz.date BETWEEN w.window_start AND w.window_end
             GROUP BY w.mp, w.seller, w.sku, w.article_1c, w.code_1c, w.cluster_to, w.window_start, w.window_end
         )
 
@@ -287,22 +301,19 @@ for date in date_range:
 
         FROM keys_today kt
         INNER JOIN valid_articles va
-            ON  kt.article_1c = va.article_1c
-            AND kt.code_1c    = va.code_1c
-            AND kt.sku        = va.sku
-            AND kt.mp         = va.mp
-        LEFT JOIN hist_before_today hist
-        ON  kt.mp=hist.mp AND kt.seller=hist.seller AND kt.sku=hist.sku
-        AND kt.article_1c=hist.article_1c AND kt.code_1c=hist.code_1c AND kt.cluster_to=hist.cluster_to
-        LEFT JOIN prev_state p
-            ON  kt.mp=p.mp AND kt.seller=p.seller AND kt.sku=p.sku
-            AND kt.article_1c=p.article_1c AND kt.code_1c=p.code_1c AND kt.cluster_to=p.cluster_to
-        LEFT JOIN cov cv
-            ON  kt.mp=cv.mp AND kt.seller=cv.seller AND kt.sku=cv.sku
-            AND kt.article_1c=cv.article_1c AND kt.code_1c=cv.code_1c AND kt.cluster_to=cv.cluster_to
-        LEFT JOIN fast_tail ft
-            ON  kt.mp=ft.mp AND kt.seller=ft.seller AND kt.sku=ft.sku
-            AND kt.article_1c=ft.article_1c AND kt.code_1c=ft.code_1c AND kt.cluster_to=ft.cluster_to
+        USING (article_1c, code_1c, sku, mp)
+
+        LEFT JOIN hist_before_today AS hist
+        USING (mp, seller, sku, article_1c, code_1c, cluster_to)
+
+        LEFT JOIN prev_state AS p
+        USING (mp, seller, sku, article_1c, code_1c, cluster_to)
+
+        LEFT JOIN cov AS cv
+        USING (mp, seller, sku, article_1c, code_1c, cluster_to)
+
+        LEFT JOIN fast_tail AS ft
+        USING (mp, seller, sku, article_1c, code_1c, cluster_to)
 
         GROUP BY
             date, mp, seller, sku, article_1c, code_1c, cluster_to,
@@ -312,6 +323,7 @@ for date in date_range:
 
     df_keys = ch_object.extract_data(query_keys)
 
+    df_keys, other_column_list = preprocess_data(df=df_keys, column_types=TYPES_KEYS, add_missed_columns=False, handle_invalid_values=False)
     ch_object.execute_query(query=f'''DELETE FROM sb.buffer_calc_keys WHERE id_ver = toInt32({PARAMS['id_ver']}) AND date = '{START_DATE}'  ''')
     ch_object.insert_data(table_name='sb.buffer_calc_keys', df=df_keys)
     # Наполняем buffer_main
@@ -322,7 +334,6 @@ for date in date_range:
     query_init  = f'''
     WITH
         toInt32({PARAMS['PERIOD']})               AS PERIOD,
-        toInt32({PARAMS['RECALC_EVERY']})         AS RECALC_EVERY,
         toFloat64({PARAMS['OOS_RATIO']})          AS OOS_RATIO,
         toFloat64({PARAMS['BAD_PRICE_LOW']})      AS BAD_PRICE_LOW,
         toFloat64({PARAMS['BAD_PRICE_HIGH']})     AS BAD_PRICE_HIGH,
