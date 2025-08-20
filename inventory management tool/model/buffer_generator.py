@@ -21,6 +21,7 @@ TYPES_KEYS = {
         'code_1c': 'string',
         'cluster_to': 'string',
         'calc_type': 'string',
+        'action_suggested': 'string',
         'new_buffer_prev': 'int64',
         'is_first_day':'int64',
         'is_recalc_day':'int64',
@@ -84,6 +85,8 @@ PARAMS = {
     'min_cluster_m3': 8,          # минимальный объем товаров на кластер
     'min_good': 3,                # минимальное количество товаров на поставку
     'min_cluster_limit': 6,       # добавлено потом: максимальный объем, при котором все равно грузим последнюю машину
+    'UP_STEP': 0.3333,            # шаг увеличения BT (+33.3%)
+    'DOWN_STEP': 0.3333,          # шаг уменьшения BT (–33.3%)
 
     # --- ДУБ / ЕГОРОВ: ОКНО НАБЛЮДЕНИЯ ---
     'M_RT': 4,                    # множитель к RT: окно = RT * M_RT (на каждый ключ)
@@ -106,7 +109,7 @@ PARAMS = {
     # 'SUSPEND_AUTORELEASE_DAYS': 3,
 }
 
-date_range = pd.date_range(start='2025-02-01', end='2025-02-01')
+date_range = pd.date_range(start='2025-02-01', end='2025-05-01')
 
 for date in date_range:
     # Преобразуем Timestamp в строку формата 'YYYY-MM-DD'
@@ -866,24 +869,31 @@ for date in date_range:
     query_recalc  = f'''
     /* ---- recalc_day (DBR/TOC) — устойчивый к пустому окну ---- */
     WITH
-        toInt32({PARAMS['PERIOD']})        AS PERIOD,
-        toFloat64({PARAMS['OOS_RATIO']})   AS OOS_RATIO,
         toInt32({PARAMS['id_ver']})        AS CUR_VER,
+        toFloat64({PARAMS['UP_STEP']})     AS UP_STEP,
+        toFloat64({PARAMS['DOWN_STEP']})   AS DOWN_STEP,
+        toInt32({PARAMS['AVG_DAYS_CONST']}) AS AVG_DAYS_CONST
 
-        toFloat64(1.0/3.0)                 AS Z_RED,
-        toFloat64(2.0/3.0)                 AS Z_GREEN,
-        toFloat64(4.0/3.0)                 AS UP_FACTOR,
-        toFloat64(2.0/3.0)                 AS DOWN_FACTOR,
-        toFloat64(0.50)                    AS UP_SHARE,
-        toFloat64(0.70)                    AS DOWN_SHARE,
-        toFloat64(0.60)                    AS MIN_WINDOW_SHARE
 
     , key_list_recalc AS (
-        SELECT DISTINCT mp, seller, sku, article_1c, code_1c, cluster_to
+        SELECT DISTINCT
+            mp, seller, sku, article_1c, code_1c, cluster_to,
+            action_suggested
         FROM sb.buffer_calc_keys
         WHERE date   = toDate('{START_DATE}')
         AND id_ver = CUR_VER
         AND calc_type = 'recalc_day'
+    )
+
+    , factor_from_action AS (
+    SELECT
+        mp, seller, sku, article_1c, code_1c, cluster_to,
+        multiIf(
+            action_suggested = 'UP',   1.0 + UP_STEP,
+            action_suggested = 'DOWN', 1.0 - DOWN_STEP,
+                                        1.0
+        ) AS factor_final
+    FROM key_list_recalc
     )
 
     , prev_state AS (
@@ -915,81 +925,45 @@ for date in date_range:
         AND cb.id_ver = CUR_VER
     )
 
-    , window_bm AS (
-        SELECT
-            bm.date       AS date,
-            bm.mp         AS mp,
-            bm.seller     AS seller,
-            bm.sku        AS sku,
-            bm.article_1c AS article_1c,
-            bm.code_1c    AS code_1c,
-            bm.cluster_to AS cluster_to,
-            bm.quantity_stocks AS quantity_stocks,
-            bm.quantity_orders AS quantity_orders
-        FROM sb.buffer_main bm
-        INNER JOIN key_list_recalc
-            USING (mp, seller, sku, article_1c, code_1c, cluster_to)
-        WHERE bm.id_ver = CUR_VER
-        AND bm.date  >= toDate('{START_DATE}') - INTERVAL RECALC_EVERY DAY
-        AND bm.date  <  toDate('{START_DATE}')
-    )
-
-    , window_zones AS (
-        SELECT
-            w.mp AS mp, w.seller AS seller, w.sku AS sku, w.article_1c AS article_1c, w.code_1c AS code_1c, w.cluster_to AS cluster_to,
-            count() AS days_total,
-            sum( (w.quantity_stocks / NULLIF(ps.buffer_cluster_prev, 0)) <= Z_RED )   AS days_red,
-            sum( (w.quantity_stocks / NULLIF(ps.buffer_cluster_prev, 0)) >= Z_GREEN ) AS days_green
-        FROM window_bm w
-        RIGHT JOIN prev_state ps
-            USING (mp, seller, sku, article_1c, code_1c, cluster_to)
-        GROUP BY w.mp, w.seller, w.sku, w.article_1c, w.code_1c, w.cluster_to
-    )
-
-    , window_order_stats AS (
-        SELECT
-            mp, seller, sku, article_1c, code_1c, cluster_to,
-            MAX(quantity_orders) AS max_orders_window
-        FROM window_bm
-        GROUP BY mp, seller, sku, article_1c, code_1c, cluster_to
-    )
-
-    , tune_decision_base AS (
-        SELECT
-            wz.mp, wz.seller, wz.sku, wz.article_1c, wz.code_1c, wz.cluster_to,
-            toFloat64(IFNULL(wz.days_total,0)) AS days_total,
-            (toFloat64(IFNULL(wz.days_red,0))   / NULLIF(toFloat64(IFNULL(wz.days_total,0)), 0)) AS share_red,
-            (toFloat64(IFNULL(wz.days_green,0)) / NULLIF(toFloat64(IFNULL(wz.days_total,0)), 0)) AS share_green,
-            multiIf(
-                share_red   >= UP_SHARE,   UP_FACTOR,
-                share_green >= DOWN_SHARE, DOWN_FACTOR,
-                1.0
-            ) AS factor_base
-        FROM window_zones wz
-    )
-
+    /* поставки, прибывающие в день D (для эволюции запасов) */
     , supplies_arrive_today AS (
-        SELECT s.mp AS mp, s.seller AS seller, s.article_1c AS article_1c, s.code_1c AS code_1c,
-            s.cluster_to AS cluster_to,
+        SELECT
+            s.mp, s.seller, s.sku, s.article_1c, s.code_1c, s.cluster_to,
             SUM(s.quantity_supplies) AS quantity_supplies_arrive
         FROM sb.buffer_supplies s
         INNER JOIN key_list_recalc
-            USING (mp, seller, article_1c, code_1c, cluster_to)
-        WHERE s.closing_date = toDate('{START_DATE}')
+            USING (mp, seller, sku, article_1c, code_1c, cluster_to)
+        WHERE s.id_ver = toString(CUR_VER)
+        AND s.closing_date = toDate('{START_DATE}')
         AND s.shipping_date <= toDate('{START_DATE}')
-        GROUP BY s.mp, s.seller, s.article_1c, s.code_1c, s.cluster_to
+        GROUP BY s.mp, s.seller, s.sku, s.article_1c, s.code_1c, s.cluster_to
     )
 
+    /* поставки в пути на день D (для маркера/потребности) */
     , supplies_in_transit_today AS (
-        SELECT s.mp AS mp, s.seller AS seller, s.article_1c AS article_1c, s.code_1c AS code_1c,
-            s.cluster_to AS cluster_to,
+        SELECT
+            s.mp, s.seller, s.sku, s.article_1c, s.code_1c, s.cluster_to,
             SUM(s.quantity_supplies) AS quantity_supplies
         FROM sb.buffer_supplies s
         INNER JOIN key_list_recalc
-            USING (mp, seller, article_1c, code_1c, cluster_to)
-        WHERE s.shipping_date <  toDate('{START_DATE}')
+            USING (mp, seller, sku, article_1c, code_1c, cluster_to)
+        WHERE s.id_ver = toString(CUR_VER)
+        AND s.shipping_date <  toDate('{START_DATE}')
         AND s.closing_date  >  toDate('{START_DATE}')
-        GROUP BY s.mp, s.seller, s.article_1c, s.code_1c, s.cluster_to
+        GROUP BY s.mp, s.seller, s.sku, s.article_1c, s.code_1c, s.cluster_to
+    )
+
+    , supplies_within_rt_today AS (
+        SELECT
+            s.mp, s.seller, s.sku, s.article_1c, s.code_1c, s.cluster_to,
+            SUM(s.quantity_supplies) AS quantity_supplies_within_rt
+        FROM sb.buffer_supplies s
+        INNER JOIN key_list_recalc
+            USING (mp, seller, sku, article_1c, code_1c, cluster_to)
+        WHERE s.id_ver = toString(CUR_VER)
+        AND s.closing_date >  toDate('{START_DATE}')
+        AND s.closing_date <= addDays(toDate('{START_DATE}'), AVG_DAYS_CONST)
+        GROUP BY s.mp, s.seller, s.sku, s.article_1c, s.code_1c, s.cluster_to
     )
 
     , stock_today AS (
@@ -998,7 +972,7 @@ for date in date_range:
             GREATEST(0, ROUND(ps.quantity_stocks_prev - ps.quantity_orders_prev + IFNULL(sa.quantity_supplies_arrive, 0))) AS quantity_stocks
         FROM prev_state ps
         LEFT JOIN supplies_arrive_today sa
-            USING (mp, seller, article_1c, code_1c, cluster_to)
+            USING (mp, seller, sku, article_1c, code_1c, cluster_to)
     )
 
     , orders_today_raw AS (
@@ -1021,70 +995,14 @@ for date in date_range:
         LEFT JOIN orders_today_raw ot USING (mp, seller, sku, article_1c, code_1c, cluster_to)
     )
 
-    , buffer_floor AS (
-        SELECT
-            ps.mp AS mp, ps.seller AS seller, ps.sku AS sku, ps.article_1c AS article_1c, ps.code_1c AS code_1c, ps.cluster_to AS cluster_to,
-            toFloat64(GREATEST(1, ps.insurance_reserv_cluster_prev, IFNULL(wos.max_orders_window, 0))) AS floor_val
-        FROM prev_state ps
-        LEFT JOIN window_order_stats wos
-            USING (mp, seller, sku, article_1c, code_1c, cluster_to)
-    )
-
-    , current_state AS (
-        SELECT
-            ps.mp AS mp, ps.seller AS seller, ps.sku AS sku, ps.article_1c AS article_1c, ps.code_1c AS code_1c, ps.cluster_to AS cluster_to,
-            /* кандидат буфера при базовом факторе; всё приводим к Float64 */
-            GREATEST(
-                toFloat64(ROUND(ps.buffer_cluster_prev * IFNULL(tdb.factor_base, 1.0))),
-                toFloat64(bf.floor_val)
-            ) AS buffer_candidate,
-            st.quantity_stocks AS quantity_stocks_today
-        FROM prev_state ps
-        LEFT JOIN tune_decision_base tdb
-            USING (mp, seller, sku, article_1c, code_1c, cluster_to)
-        LEFT JOIN buffer_floor bf
-            USING (mp, seller, sku, article_1c, code_1c, cluster_to)
-        LEFT JOIN stock_today st
-            USING (mp, seller, sku, article_1c, code_1c, cluster_to)
-    )
-
-    , final_decision AS (
-        SELECT
-            ps.mp AS mp, ps.seller AS seller, ps.sku AS sku, ps.article_1c AS article_1c, ps.code_1c AS code_1c, ps.cluster_to AS cluster_to,
-            /* маркер «как есть на складе» от кандидата */
-            ROUND(
-                LEAST(
-                    IFNULL( cs.quantity_stocks_today / NULLIF(cs.buffer_candidate, 0), 1 ),
-                    1
-                ), 2
-            ) AS marker_current,
-            /* защищённый фактор: если нет окна — 1; красная сегодня — тянем вверх; зелёная и base>1 — блок ап */
-            multiIf(
-                IFNULL(tdb.days_total, 0) < (RECALC_EVERY * MIN_WINDOW_SHARE), 1.0,
-                marker_current <= Z_RED,                                       UP_FACTOR,
-                (marker_current >= Z_GREEN) AND (IFNULL(tdb.factor_base,1.0) > 1.0), 1.0,
-                IFNULL(tdb.factor_base, 1.0)
-            ) AS factor_final
-        FROM prev_state ps
-        LEFT JOIN tune_decision_base tdb
-            USING (mp, seller, sku, article_1c, code_1c, cluster_to)
-        LEFT JOIN current_state cs
-            USING (mp, seller, sku, article_1c, code_1c, cluster_to)
-    )
-
     , buffer_new AS (
         SELECT
-            ps.mp AS mp, ps.seller AS seller, ps.sku AS sku, ps.article_1c AS article_1c, ps.code_1c AS code_1c, ps.cluster_to AS cluster_to,
+            ps.mp, ps.seller, ps.sku, ps.article_1c, ps.code_1c, ps.cluster_to,
             ROUND(
-                GREATEST(
-                    toFloat64(ps.buffer_cluster_prev) * IFNULL(fd.factor_final, 1.0),
-                    toFloat64(bf.floor_val)
-                )
+                toFloat64(ps.buffer_cluster_prev) * ifNull(ffa.factor_final, 1.0)
             ) AS buffer_cluster_new
         FROM prev_state ps
-        LEFT JOIN final_decision fd
-            USING (mp, seller, sku, article_1c, code_1c, cluster_to)
-        LEFT JOIN buffer_floor bf
+        LEFT JOIN factor_from_action ffa
             USING (mp, seller, sku, article_1c, code_1c, cluster_to)
     )
 
@@ -1112,17 +1030,35 @@ for date in date_range:
         ps.buffer_cluster_norm_prev     AS buffer_cluster_norm,
 
         bn.buffer_cluster_new           AS buffer_cluster,
+        /* ДУБ: потребность считаем с учётом OnHand + InboundWithinRT */
         greatest(
             0,
-            ROUND( bn.buffer_cluster_new - st.quantity_stocks - IFNULL(sit.quantity_supplies, 0) )
-        )                               AS deliveries_to_cluster,
+            ROUND( bn.buffer_cluster_new
+                - st.quantity_stocks
+                - ifNull(swr.quantity_supplies_within_rt, 0) )
+        ) AS deliveries_to_cluster,
+
+        /* ДУБ: маркер ТЕКУЩИЙ (current) = (OnHand + WithinRT) / BT_new */
         ROUND(
-            LEAST(
-                IFNULL( (st.quantity_stocks + IFNULL(sit.quantity_supplies, 0)) / NULLIF(bn.buffer_cluster_new, 0), 1 ),
-                1
-            ),
-            2
-        )                               AS buffer_cluster_marker,
+        LEAST(
+            IFNULL(
+            (st.quantity_stocks + ifNull(swr.quantity_supplies_within_rt, 0))
+            / NULLIF(bn.buffer_cluster_new, 0),
+            1
+            ), 1
+        ), 2
+        ) AS buffer_cluster_marker_current,
+
+        /* Твой прежний «pipeline» маркер — оставляем как есть */
+        ROUND(
+        LEAST(
+            IFNULL(
+            (st.quantity_stocks + IFNULL(sit.quantity_supplies, 0))
+            / NULLIF(bn.buffer_cluster_new, 0),
+            1
+            ), 1
+        ), 2
+        ) AS buffer_cluster_marker,
 
         multiIf(ifNull(st.quantity_stocks, 0) <= 0, 0, ifNull(ots.quantity_orders, 0)) AS quantity_orders,
         st.quantity_stocks              AS quantity_stocks,
@@ -1132,15 +1068,14 @@ for date in date_range:
     FROM prev_state ps
     LEFT  JOIN buffer_new                bn  USING (mp, seller, sku, article_1c, code_1c, cluster_to)
     LEFT  JOIN stock_today               st  USING (mp, seller, sku, article_1c, code_1c, cluster_to)
-    LEFT  JOIN supplies_in_transit_today sit USING (mp, seller, article_1c, code_1c, cluster_to)
+    LEFT JOIN supplies_in_transit_today  sit USING (mp, seller, sku, article_1c, code_1c, cluster_to)
+    LEFT  JOIN supplies_within_rt_today   swr USING (mp, seller, sku, article_1c, code_1c, cluster_to)
     LEFT  JOIN orders_today_sim          ots USING (mp, seller, sku, article_1c, code_1c, cluster_to)
     LEFT  JOIN (
         SELECT DISTINCT name, article_1c, code_1c
         FROM ref.article_mp
         WHERE discounted != 1 AND brand != 'РЕСЕЙЛ'
     ) r USING (article_1c, code_1c)
-
-
     '''
 
     df_recalc = ch_object.extract_data(query_recalc)
