@@ -73,7 +73,7 @@ TYPES_SUP = {
 
 PARAMS = {
     # --- Служебные (в т.ч. для формирования первичного буфера) ---   
-    'id_ver': 2,                 # версия расчёта 
+    'id_ver': 4,                 # версия расчёта 
     'PERIOD': 30,                 # окно истории продаж для расчётов (дни) - используется для init day и используется в т.ч. (пока нет товарной матрицы) для определения пула на расчета буфера
     'AVG_DAYS_CONST': 7,          # дефолтный RT (дней), пока нет фактического по ключу
     'OOS_RATIO': 0.02,            # порог "низкий запас" (для аналитики/отчетов, не влияет на ДУБ)
@@ -192,7 +192,9 @@ for date in date_range:
         , prev_state AS (
             SELECT
                 mp, seller, sku, article_1c, code_1c, cluster_to,
-                max(toInt16(new_buffer)) AS new_buffer_prev
+                max(toInt16(new_buffer))   AS new_buffer_prev,
+                max(buffer_cluster)        AS bt_prev,
+                max(quantity_stocks)       AS stocks_prev
             FROM sb.buffer_main
             WHERE date = toDate('{START_DATE}') - INTERVAL 1 DAY
             AND id_ver = CUR_VER
@@ -339,8 +341,11 @@ for date in date_range:
             /* итоговое действие с предохранителями */
             multiIf(
                 -- 1) есть поставки в пределах RT → удерживаем вместо UP
-                (action_raw = 'UP' AND ifNull(swk.quantity_supplies_within_rt, 0) > 0), 'HOLD',
-
+                (
+                action_raw = 'UP' AND ifNull(
+                        least((toFloat64(ifNull(p.stocks_prev, 0)) + ifNull(swk.quantity_supplies_within_rt, 0))
+                        / nullIf(toFloat64(ifNull(p.bt_prev, 0)), 0),
+                        1),0) >= 0.5), 'HOLD',
                 -- 2) кулдаун < RECALC_COOLDOWN_DAYS с последнего изменения буфера
                 (action_raw IN ('UP','DOWN'))
                 AND (ifNull(p.new_buffer_prev, 9999) < toUInt32(RECALC_COOLDOWN_DAYS))
