@@ -1,7 +1,8 @@
 # Custom
 .vscode
-Инструмент управления запасами/Моделирование на Python/data/out
-Инструмент управления запасами/Моделирование на Python/draft*
+inventory management tool/Моделирование на Python/data/out
+inventory management tool/Моделирование на Python/draft*
+inventory management tool/Моделирование на Python/data/tmp
 
 
 # Byte-compiled / optimized / DLL files
