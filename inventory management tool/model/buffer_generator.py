@@ -73,7 +73,7 @@ TYPES_SUP = {
 
 PARAMS = {
     # --- Служебные (в т.ч. для формирования первичного буфера) ---   
-    'id_ver': 3,                 # версия расчёта 
+    'id_ver': 2,                 # версия расчёта 
     'PERIOD': 30,                 # окно истории продаж для расчётов (дни) - используется для init day и используется в т.ч. (пока нет товарной матрицы) для определения пула на расчета буфера
     'AVG_DAYS_CONST': 7,          # дефолтный RT (дней), пока нет фактического по ключу
     'OOS_RATIO': 0.02,            # порог "низкий запас" (для аналитики/отчетов, не влияет на ДУБ)
@@ -92,7 +92,11 @@ PARAMS = {
     'RED_SHARE_UP': 0.3333,          # UP, если красных >= 1/3 наблюдаемых дней в окне
     'GREEN_SHARE_DOWN': 0.66666,      # DOWN, если зеленых >= 2/3 и нет красн/черн
     'REQUIRE_COVERAGE': 0.6,      # мин. доля календарных дней с валидной зоной в окне; иначе HOLD
-    'FAST_RED_STREAK': 3         # быстрый триггер UP: N подряд дней "красных" в конце окна
+    'FAST_RED_STREAK': 3,         # быстрый триггер UP: N подряд дней "красных" в конце окна
+
+    # --- Прогнозирование на основе средневзешенной медианы ---
+    'CAP_Q': 0.90,          # чуствительность к проколам
+    'H': 5                  # чуствительность к прогнозу
 
     # --- Прочее ---
     #'RECEIVING_DAYS': 0,          # если приемка/разблокировка не входит в RT, поставь реальное значение (>0) (пока не используем для упрощения)
@@ -398,15 +402,18 @@ for date in date_range:
     print('query_init')
     query_init  = f'''
     WITH
-        toInt32({PARAMS['PERIOD']})               AS PERIOD,
-        toFloat64({PARAMS['OOS_RATIO']})          AS OOS_RATIO,
-        toFloat64({PARAMS['BAD_PRICE_LOW']})      AS BAD_PRICE_LOW,
-        toFloat64({PARAMS['BAD_PRICE_HIGH']})     AS BAD_PRICE_HIGH,
-        toFloat64({PARAMS['MAX_EXCLUDED_SHARE']}) AS MAX_EXCLUDED_SHARE,
-        toInt32({PARAMS['AVG_DAYS_CONST']})       AS RT_DEFAULT,
-        toInt32({PARAMS['INS_CONST']})            AS INS_CONST,
-        toInt32({PARAMS['AVG_DAYS_CONST']}) * toInt32({PARAMS['M_RT']})       AS BUF_NORM_CONST,
-        toInt32({PARAMS['id_ver']})               AS CUR_VER
+        toInt32({PARAMS['PERIOD']})                 AS PERIOD,
+        toFloat64({PARAMS['OOS_RATIO']})            AS OOS_RATIO,
+        toFloat64({PARAMS['BAD_PRICE_LOW']})        AS BAD_PRICE_LOW,
+        toFloat64({PARAMS['BAD_PRICE_HIGH']})       AS BAD_PRICE_HIGH,
+        toFloat64({PARAMS['MAX_EXCLUDED_SHARE']})   AS MAX_EXCLUDED_SHARE,
+        toInt32({PARAMS['AVG_DAYS_CONST']})         AS RT_DEFAULT,
+        toInt32({PARAMS['INS_CONST']})              AS INS_CONST,
+        toInt32({PARAMS['AVG_DAYS_CONST']}) * toInt32({PARAMS['M_RT']})     AS BUF_NORM_CONST,
+        toInt32({PARAMS['id_ver']})                 AS CUR_VER,
+        toFloat64({PARAMS['CAP_Q']})                AS CAP_Q, -- например 0.90
+        toFloat64({PARAMS['H']})                    AS H,     -- например 5.0
+        (1 - pow(2, -1/H))                          AS ALPHA -- α для EWMA
 
     , key_list_prime AS (
         SELECT DISTINCT mp, seller, sku, article_1c, code_1c, cluster_to
@@ -432,7 +439,7 @@ for date in date_range:
         FROM sb.buffer_supplies s
         WHERE id_ver = toString(CUR_VER)
         /* включительно по RT, строго после текущей даты */
-        AND closing_date >  toDate('{START_DATE}')
+        AND closing_date > toDate('{START_DATE}')
         AND closing_date <= addDays(toDate('{START_DATE}'), RT_DEFAULT)
         GROUP BY mp, seller, sku, article_1c, code_1c, cluster_to
     )
@@ -477,7 +484,7 @@ for date in date_range:
         INNER JOIN key_list_prime
             USING (mp, seller, sku, article_1c, code_1c, cluster_to)
         WHERE smp.date >= toDate('{START_DATE}') - INTERVAL PERIOD DAY
-        AND smp.date  < toDate('{START_DATE}')
+        AND smp.date < toDate('{START_DATE}')
         GROUP BY date, mp, seller, sku, article_1c, code_1c, cluster_to
     )
 
@@ -503,7 +510,7 @@ for date in date_range:
         FROM ref.calendar am
         CROSS JOIN keys k
         WHERE am.date >= toDate('{START_DATE}') - INTERVAL PERIOD DAY
-        AND am.date  <  toDate('{START_DATE}')
+        AND am.date < toDate('{START_DATE}')
     )
 
     , max_stocks_per_cluster AS (
@@ -561,7 +568,7 @@ for date in date_range:
                 (ms.orders_sum/ms.quantity_orders)        AS avg_price_per_day,
                 (ms.cost_value_orders/ms.quantity_orders) AS avg_cost,
                 mpk.median_price,
-                (avg_price_per_day/mpk.median_price - 1)  AS rate,
+                (avg_price_per_day/mpk.median_price - 1) AS rate,
                 IF(rate<=BAD_PRICE_LOW, 'Низкая цена', IF(rate>=BAD_PRICE_HIGH, 'Высокая цена', '')) AS bad_price
         FROM calendar cal
         LEFT JOIN orders_per_cluster_prime AS ms
@@ -624,7 +631,7 @@ for date in date_range:
         FROM main am
         LEFT JOIN days_oos_number don USING (mp, seller, sku, article_1c, code_1c, cluster_to)
         LEFT JOIN bad_price_number bp USING (mp, seller, sku, article_1c, code_1c, cluster_to)
-        LEFT JOIN supplies sup      USING (mp, seller, article_1c, code_1c, cluster_to)
+        LEFT JOIN supplies sup     USING (mp, seller, article_1c, code_1c, cluster_to)
         LEFT JOIN supplies_within_rt swr
             USING (mp, seller, sku, article_1c, code_1c, cluster_to)
         LEFT JOIN stocks_mp smp
@@ -641,45 +648,71 @@ for date in date_range:
     )
 
     , final_exclude AS (
+        /* «Правильное среднее»: P90-кап + EWMA по «хорошим» дням окна [D-PERIOD, D) */
         SELECT
-            am.mp AS mp, am.seller AS seller, am.sku AS sku,
-            am.article_1c AS article_1c, am.code_1c AS code_1c, am.cluster_to AS cluster_to,
+            gd.mp, gd.seller, gd.sku, gd.article_1c, gd.code_1c, gd.cluster_to,
 
-            /* заказы на START_DATE как и раньше, берём из ms */
+            /* заказы на START_DATE — как раньше, берём отдельным join */
             ms.quantity_orders AS quantity_orders,
 
-            /* для справки: невзвешенная сумма по окну */
-            SUM(am.quantity_orders) AS total_quantity_orders,
+            /* (для справки) невзвешенная сумма по окну */
+            SUM(gd.quantity_orders) AS total_quantity_orders,
 
-            /* ГЛАВНОЕ: взвешенное среднее по «хорошим» дням окна [D-PERIOD, D) */
-            SUM(am.quantity_orders * am.w) / NULLIF(SUM(am.w), 0) AS avg_quantity_orders
-        FROM main am
+            /* массив заказов за окно (по дате), с нулями там, где их не было */
+            arrayMap(x -> x.2,
+                     arraySort(x -> x.1,
+                               groupArray((gd.date, gd.quantity_orders)))
+            ) AS arr,
+
+            /* P90 окна и капированный массив */
+            quantileExact(CAP_Q)(gd.quantity_orders)        AS p90_win,
+            arrayMap(v -> least(v, p90_win), arr)         AS arr_cap,
+
+            /* EWMA по капированному массиву (весим «свежее» сильнее) */
+            length(arr_cap)                                 AS n,
+            arrayReverse(arr_cap)                         AS rev,
+            arrayMap(i -> pow(1 - ALPHA, i - 1), arrayEnumerate(rev)) AS geom,
+            (1 - pow(1 - ALPHA, n))                         AS wnorm,
+            /* итог: λ_t на конец окна = «среднее спроса» */
+            arraySum(arrayMap((v, w) -> v * w, rev, geom)) * (ALPHA / nullIf(wnorm, 0)) AS avg_quantity_orders
+
+        FROM (
+            /* «хорошие» дни окна: без OOS и без плохой цены, как у тебя было */
+            SELECT
+                am.date,
+                am.mp, am.seller, am.sku, am.article_1c, am.code_1c, am.cluster_to,
+                toFloat64(ifNull(am.quantity_orders, 0)) AS quantity_orders
+            FROM main am
+            WHERE am.date >= toDate('{START_DATE}') - INTERVAL PERIOD DAY
+            AND am.date < toDate('{START_DATE}')
+            AND (am.out_of_stocks != 'Низкий запас' AND am.bad_price != 'Низкая цена')
+        ) AS gd
+        /* «снимок» заказов на START_DATE для этого же ключа */
         LEFT JOIN orders_per_cluster_prime ms
-            ON am.date = ms.date AND am.mp = ms.mp AND am.seller = ms.seller
-        AND am.sku = ms.sku AND am.article_1c = ms.article_1c AND am.code_1c = ms.code_1c
-        AND am.cluster_to = ms.cluster_to AND ms.date = toDate('{START_DATE}')
-        /* исключаем «плохие» дни при усреднении: OOS и плохая цена */
-        WHERE am.date >= toDate('{START_DATE}') - INTERVAL PERIOD DAY
-        AND am.date  <  toDate('{START_DATE}')
-        AND (am.out_of_stocks != 'Низкий запас' AND am.bad_price != 'Низкая цена')
-        GROUP BY am.mp, am.seller, am.sku, am.article_1c, am.code_1c, am.cluster_to, ms.quantity_orders
+        ON gd.mp = ms.mp AND gd.seller = ms.seller AND gd.sku = ms.sku
+        AND gd.article_1c = ms.article_1c AND gd.code_1c = ms.code_1c
+        AND gd.cluster_to = ms.cluster_to AND ms.date = toDate('{START_DATE}')
+        GROUP BY
+            gd.mp, gd.seller, gd.sku, gd.article_1c, gd.code_1c, gd.cluster_to,
+            ms.quantity_orders
     )
 
+
     SELECT
-        CUR_VER                           AS id_ver,
+        CUR_VER                         AS id_ver,
         toDate('{START_DATE}')            AS date,
         r.name                            AS name,
         article_1c                        AS article_1c,
-        code_1c                           AS code_1c,
+        code_1c                         AS code_1c,
         mp                                AS mp,
         seller                            AS seller,
-        sku                               AS sku,
+        sku                             AS sku,
         cluster_to                        AS cluster_to,
 
         oos.total_quantity_orders         AS total_quantity_orders,
         max_quantity_order                AS max_quantity_order,
         ROUND(oos.avg_quantity_orders, 2) AS avg_quantity_orders,
-        days_oos_number                   AS days_oos_number,
+        days_oos_number                 AS days_oos_number,
         days_bp_number                    AS days_bp_number,
 
         RT_DEFAULT                        AS avg_day_to_cluster,
@@ -708,7 +741,7 @@ for date in date_range:
                     / NULLIF(BUF_NORM_CONST*avg_quantity_orders, 0), 1),
             1), 2) AS buffer_cluster_marker,
         multiIf(ifNull(quantity_stocks, 0) <= 0, 0, ifNull(oos.quantity_orders, 0)) AS quantity_orders,
-        quantity_stocks                   AS quantity_stocks,
+        quantity_stocks                 AS quantity_stocks,
         quantity_supplies                 AS quantity_supplies,
         ifNull(quantity_supplies_within_rt, 0) AS quantity_supplies_within_rt,
         0                                 AS new_buffer
@@ -721,7 +754,7 @@ for date in date_range:
         WHERE discounted != 1 AND brand != 'РЕСЕЙЛ'
     ) r USING (article_1c, code_1c)
     WHERE days_oos_number <= (PERIOD - PERIOD/6)
-    AND days_bp_number  <= (PERIOD - PERIOD/6)
+    AND days_bp_number <= (PERIOD - PERIOD/6)
     AND total_quantity_orders != 0
 
     '''
