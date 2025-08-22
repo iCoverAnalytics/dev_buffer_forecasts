@@ -967,23 +967,18 @@ for date in date_range:
     , key_list_recalc AS (
         SELECT DISTINCT
             mp, seller, sku, article_1c, code_1c, cluster_to,
-            action_suggested
+            action_suggested, min_buffer,
+            multiIf(
+            action_suggested = 'UP',   1.0 + UP_STEP,
+            action_suggested = 'DOWN', 1.0 - DOWN_STEP,
+                                        1.0
+            ) AS factor_final
         FROM sb.buffer_calc_keys
         WHERE date   = toDate('{START_DATE}')
         AND id_ver = CUR_VER
         AND calc_type = 'recalc_day'
     )
 
-    , factor_from_action AS (
-    SELECT
-        mp, seller, sku, article_1c, code_1c, cluster_to,
-        multiIf(
-            action_suggested = 'UP',   1.0 + UP_STEP,
-            action_suggested = 'DOWN', 1.0 - DOWN_STEP,
-                                        1.0
-        ) AS factor_final
-    FROM key_list_recalc
-    )
 
     , prev_state AS (
         SELECT
@@ -1084,60 +1079,17 @@ for date in date_range:
         LEFT JOIN orders_today_raw ot USING (mp, seller, sku, article_1c, code_1c, cluster_to)
     )
 
-    , win_floor AS (
-        SELECT
-            mp, seller, sku, article_1c, code_1c, cluster_to,
-            addDays(toDate('{START_DATE}') - 1, -(RT_DEFAULT * 4) + 1) AS w_start,
-            toDate('{START_DATE}') - 1 AS w_end
-        FROM key_list_recalc
-    )
-
-    , avg_orders AS (
-    SELECT
-        bm.mp as mp, bm.seller as seller, bm.sku as sku, bm.article_1c as article_1c, bm.code_1c as code_1c, bm.cluster_to as cluster_to,
-        SUM(bm.quantity_orders) AS sum_orders,
-        countDistinct(bm.date)  AS days_obs,
-        SUM(bm.quantity_orders) / NULLIF(countDistinct(bm.date), 0) AS avg_daily_orders
-    FROM sb.buffer_main bm
-    INNER JOIN win_floor wf
-        ON  bm.mp = wf.mp AND bm.seller = wf.seller AND bm.sku = wf.sku
-        AND bm.article_1c = wf.article_1c AND bm.code_1c = wf.code_1c
-        AND bm.cluster_to = wf.cluster_to
-    WHERE bm.id_ver = CUR_VER
-      AND bm.date BETWEEN wf.w_start AND wf.w_end
-    GROUP BY bm.mp, bm.seller, bm.sku, bm.article_1c, bm.code_1c, bm.cluster_to
-    )
-
-    , buffer_floor AS (
-    SELECT
-        ps.mp as mp, ps.seller as seller, ps.sku as sku, ps.article_1c as article_1c, ps.code_1c as code_1c, ps.cluster_to as cluster_to,
-        greatest(
-            toFloat64(1),
-            toFloat64(RT_DEFAULT * 2) *
-            if(
-                ifNull(ao.days_obs, 0) >= toUInt32(round(RT_DEFAULT * 4 * REQUIRE_COVERAGE)),
-                ifNull(ao.avg_daily_orders, 0),
-                0
-            )
-        ) AS floor_val
-    FROM prev_state ps
-    LEFT JOIN avg_orders ao
-      USING (mp, seller, sku, article_1c, code_1c, cluster_to)
-    )
-
-
     , buffer_new AS (
         SELECT
             ps.mp as mp, ps.seller as seller, ps.sku as sku, ps.article_1c as article_1c, ps.code_1c as code_1c, ps.cluster_to as cluster_to,
             ROUND(
                 greatest(
                     toFloat64(ps.buffer_cluster_prev) * ifNull(ffa.factor_final, 1.0),
-                    bf.floor_val
+                    ffa.min_buffer
                 )
             ) AS buffer_cluster_new
         FROM prev_state ps
-        LEFT JOIN factor_from_action ffa USING (mp, seller, sku, article_1c, code_1c, cluster_to)
-        LEFT JOIN buffer_floor bf       USING (mp, seller, sku, article_1c, code_1c, cluster_to)
+        LEFT JOIN key_list_recalc ffa USING (mp, seller, sku, article_1c, code_1c, cluster_to)
     )
 
     /* ФИНАЛ */
