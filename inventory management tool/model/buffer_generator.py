@@ -1220,17 +1220,29 @@ for date in date_range:
     )
 
     , buffer_new AS (
-        SELECT
-            ps.mp as mp, ps.seller as seller, ps.sku as sku, ps.article_1c as article_1c, ps.code_1c as code_1c, ps.cluster_to as cluster_to,
-            ROUND(
-                greatest(
-                    toInt64(ps.buffer_cluster_prev) * toInt64(ifNull(ffa.factor_final, 1.0)),
-                    toInt64(ffa.min_buffer)
-                )
-            ) AS buffer_cluster_new
-        FROM prev_state ps
-        LEFT JOIN key_list_recalc ffa USING (mp, seller, sku, article_1c, code_1c, cluster_to)
+    SELECT ps.mp as mp, ps.seller as seller, ps.sku as sku, ps.article_1c as article_1c, ps.code_1c as code_1c, ps.cluster_to as cluster_to,
+    /* кандидат по фактору (сохраняем дробную часть до округления) */
+    toInt64(
+        round( toFloat64(ps.buffer_cluster_prev) * ifNull(ffa.factor_final, 1.0) )
+    ) AS bt_candidate,
+
+    /* итог: min_buffer применяется ТОЛЬКО для DOWN; если шаг ниже минимума — не меняем буфер */
+    case
+        when ffa.action_suggested = 'DOWN' then
+            if(
+                bt_candidate < toInt64(ifNull(ffa.min_buffer, 1)),
+                ps.buffer_cluster_prev,      -- оставить как было
+                bt_candidate
+            )
+        else
+            bt_candidate                    -- UP / HOLD: без участия min_buffer
+    end AS buffer_cluster_new
+
+    FROM prev_state ps
+    LEFT JOIN key_list_recalc ffa
+      USING (mp, seller, sku, article_1c, code_1c, cluster_to)
     )
+
 
     /* ФИНАЛ */
     SELECT
