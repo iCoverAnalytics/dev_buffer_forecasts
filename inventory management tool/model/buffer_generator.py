@@ -97,7 +97,7 @@ PARAMS = {
 
     # --- Прогнозирование на основе средневзешенной медианы ---
     'CAP_Q': 0.90,          # чуствительность к проколам
-    'H': 5                  # чуствительность к прогнозу
+    'H': 5,                 # чуствительность к прогнозу
 
     # --- Прочее ---
     #'RECEIVING_DAYS': 0,          # если приемка/разблокировка не входит в RT, поставь реальное значение (>0) (пока не используем для упрощения)
@@ -112,6 +112,12 @@ PARAMS = {
     # 'SUSPEND_SOFT_DOWN': ['bad_price'],                                   # зарезервировано
     # 'SUSPEND_TTL_DAYS': 30,
     # 'SUSPEND_AUTORELEASE_DAYS': 3,
+
+    # --- Советы диванного GPG ---
+    'Z'               : 2.33,
+    'B_MULT'          : 1.0,            # ручное увеличение буфера (множитель)
+    'B_EXTRA_DAYS'    : 0,              # дни покрытия сверху
+    'ADVICE_TOL'      : 0.05,           # допуск, (±5%). Если советов слишком много — увеличь до 0.10
 }
 
 query_volumes = """
@@ -134,269 +140,389 @@ for date in date_range:
 
     print('query_keys')
     query_keys  = f'''
-    /* ===================== ПАРАМЕТРЫ ===================== */
-        WITH
-            {PARAMS['PERIOD']}              AS PERIOD,              -- интервал для выбора ключей из заказов
-            {PARAMS['AVG_DAYS_CONST']}      AS RT_DEFAULT,          -- дефолтный RT (дни) пока нет фактического
-            {PARAMS['M_RT']}                AS M_RT,                -- множитель RT (окно = RT * M_RT)
-            {PARAMS['RED_SHARE_UP']}        AS RED_SHARE_UP,        -- мин. доля дней с зоной в окне
-            {PARAMS['GREEN_SHARE_DOWN']}    AS GREEN_SHARE_DOWN,    -- мин. доля дней с зоной в окне
-            {PARAMS['REQUIRE_COVERAGE']}    AS REQUIRE_COVERAGE,    -- мин. доля дней с зоной в окне
-            {PARAMS['FAST_RED_STREAK']}     AS FAST_RED_STREAK,     -- быстрый триггер: N последних дней красные
-            {PARAMS['RECALC_COOLDOWN_DAYS']} AS RECALC_COOLDOWN_DAYS,
-            {PARAMS['id_ver']}              AS CUR_VER
+        /* ===================== ПАРАМЕТРЫ ===================== */
+            WITH
+                {PARAMS['PERIOD']}              AS PERIOD,              -- интервал для выбора ключей из заказов
+                {PARAMS['AVG_DAYS_CONST']}      AS RT_DEFAULT,          -- дефолтный RT (дни) пока нет фактического
+                {PARAMS['M_RT']}                AS M_RT,                -- множитель RT (окно = RT * M_RT)
+                {PARAMS['RED_SHARE_UP']}        AS RED_SHARE_UP,        -- мин. доля дней с зоной в окне
+                {PARAMS['GREEN_SHARE_DOWN']}    AS GREEN_SHARE_DOWN,    -- мин. доля дней с зоной в окне
+                {PARAMS['REQUIRE_COVERAGE']}    AS REQUIRE_COVERAGE,    -- мин. доля дней с зоной в окне
+                {PARAMS['FAST_RED_STREAK']}     AS FAST_RED_STREAK,     -- быстрый триггер: N последних дней красные
+                {PARAMS['RECALC_COOLDOWN_DAYS']} AS RECALC_COOLDOWN_DAYS,
+                {PARAMS['id_ver']}              AS CUR_VER,
+                /* --- Советы диванного GPG --- */
+                toFloat64({PARAMS['CAP_Q']})           AS CAP_Q,          -- напр. 0.90
+                toFloat64({PARAMS['H']})               AS H,              -- напр. 5.0
+                (1 - pow(2, -1/H))                     AS ALPHA,          -- alpha для EWMA
+                toFloat64({PARAMS['Z']})               AS Z,              -- напр. 1.96 или 2.33
+                toFloat64({PARAMS['B_MULT']})          AS B_MULT,         -- напр. 1.00..1.15 (uplift множитель)
+                toFloat64({PARAMS['B_EXTRA_DAYS']})    AS B_EXTRA_DAYS,   -- напр. 0..1.0 (дни покрытия сверху)
+                toFloat64({PARAMS['ADVICE_TOL']})      AS ADVICE_TOL      -- допуск, напр. 0.05 (=±5%)
 
-        /* ---------- 1) Кандидаты: строго по PERIOD (Далее будет по Товарной матрице) ---------- */
-        , keys_from_sales AS (
-            SELECT DISTINCT mp, seller, sku, article_1c, code_1c, cluster_to
-            FROM kpi.all_mp_sales_wsb
-            WHERE date >= toDate('{START_DATE}') - INTERVAL PERIOD DAY
-            AND date <  toDate('{START_DATE}')
-        )
+            /* ---------- 1) Кандидаты: строго по PERIOD (Далее будет по Товарной матрице) ---------- */
+            , keys_from_sales AS (
+                SELECT DISTINCT mp, seller, sku, article_1c, code_1c, cluster_to
+                FROM kpi.all_mp_sales_wsb
+                WHERE date >= toDate('{START_DATE}') - INTERVAL PERIOD DAY
+                AND date <  toDate('{START_DATE}')
+            )
 
-        /* уже имеют расчитанный буфер */
-        , keys_from_sim_yesterday AS (
-            SELECT DISTINCT mp, seller, sku, article_1c, code_1c, cluster_to
-            FROM sb.buffer_main
-            WHERE date   = toDate('{START_DATE}') - INTERVAL 1 DAY
-            AND id_ver = CUR_VER
-        )
+            /* уже имеют расчитанный буфер */
+            , keys_from_sim_yesterday AS (
+                SELECT DISTINCT mp, seller, sku, article_1c, code_1c, cluster_to
+                FROM sb.buffer_main
+                WHERE date   = toDate('{START_DATE}') - INTERVAL 1 DAY
+                AND id_ver = CUR_VER
+            )
 
-        /* полный набор ключей */
-        , keys_today AS (
-            SELECT * FROM keys_from_sales
-            UNION DISTINCT
-            SELECT * FROM keys_from_sim_yesterday
-        )
+            /* полный набор ключей */
+            , keys_today AS (
+                SELECT * FROM keys_from_sales
+                UNION DISTINCT
+                SELECT * FROM keys_from_sim_yesterday
+            )
 
-        /* валидные артикулы только для нужных МП - базовый фильтр (Дальше будет заменен Товарной мтарицей) */
-        , valid_articles AS (
-            SELECT DISTINCT article_1c, code_1c, sku, mp
-            FROM ref.article_mp
-            WHERE discounted != 1
-            AND brand != 'РЕСЕЙЛ'
-            AND mp IN ('Ozon','WB','YM')
-        )
+            /* валидные артикулы только для нужных МП - базовый фильтр (Дальше будет заменен Товарной мтарицей) */
+            , valid_articles AS (
+                SELECT DISTINCT article_1c, code_1c, sku, mp
+                FROM ref.article_mp
+                WHERE discounted != 1
+                AND brand != 'РЕСЕЙЛ'
+                AND mp IN ('Ozon','WB','YM')
+            )
 
-        /* есть ли ХОТЬ КАКАЯ история по текущей версии ДО D (а не только на D-1) - в дальнейшем должно быть синхронизировано с SUSPEND */
-        , hist_before_today AS (
-            SELECT
-                mp, seller, sku, article_1c, code_1c, cluster_to,
-                count() AS cnt_hist
-            FROM sb.buffer_main
-            WHERE date < toDate('{START_DATE}')
-            AND id_ver = CUR_VER
-            GROUP BY mp, seller, sku, article_1c, code_1c, cluster_to
-        )
-
-        /* состояние на D-1 */
-        , prev_state AS (
-            SELECT
-                mp, seller, sku, article_1c, code_1c, cluster_to,
-                max(toInt16(new_buffer))   AS new_buffer_prev,
-                max(buffer_cluster)        AS bt_prev,
-                max(quantity_stocks)       AS stocks_prev
-            FROM sb.buffer_main
-            WHERE date = toDate('{START_DATE}') - INTERVAL 1 DAY
-            AND id_ver = CUR_VER
-            GROUP BY mp, seller, sku, article_1c, code_1c, cluster_to
-        )
-
-        , supplies_within_rt_keys AS (
-            SELECT
-                s.mp as mp, s.seller as seller, s.sku as sku, s.article_1c as article_1c, s.code_1c as code_1c, s.cluster_to as cluster_to,
-                SUM(s.quantity_supplies) AS quantity_supplies_within_rt
-            FROM sb.buffer_supplies s
-            INNER JOIN keys_today kt
-                USING (mp, seller, sku, article_1c, code_1c, cluster_to)
-            WHERE s.id_ver = toString(CUR_VER)
-            /* поставки, чей closing_date попадает в (D; D+RT] */
-            AND s.closing_date >  toDate('{START_DATE}')
-            AND s.closing_date <= addDays(toDate('{START_DATE}'), RT_DEFAULT)
-            GROUP BY s.mp, s.seller, s.sku, s.article_1c, s.code_1c, s.cluster_to
-        )
-
-        /* ---------- 2) Окно ДУБ: необходимо в отдельном CTE, т.к. дальше будет разное кол-во дней окна на разные ключи ---------- */
-        , win AS (
-            SELECT
-                mp, seller, sku, article_1c, code_1c, cluster_to,
-                RT_DEFAULT                                    AS rt_days,
-                toDate('{START_DATE}') - 1                    AS window_end,
-                addDays(toDate('{START_DATE}') - 1, -(RT_DEFAULT * M_RT) + 1) AS window_start
-            FROM keys_today kt
-        )
-
-        /* ---------- 3) День-стейт из sb.buffer_main за окно ---------- */
-        , day_state AS (
-        SELECT
-            bm.date AS date, bm.mp as mp, bm.seller as seller, bm.sku as sku, bm.article_1c as article_1c, bm.code_1c as code_1c, bm.cluster_to as cluster_to,
-            toInt64(argMax(buffer_cluster, bm.date))     AS bt,
-            toInt64(argMax(quantity_stocks, bm.date))    AS available   -- только склад
-        FROM sb.buffer_main bm
-        INNER JOIN win w
-            ON bm.mp = w.mp AND bm.seller = w.seller AND bm.sku = w.sku
-        AND bm.article_1c = w.article_1c AND bm.code_1c = w.code_1c
-        AND bm.cluster_to = w.cluster_to
-        WHERE bm.id_ver = CUR_VER
-            AND bm.date >= w.window_start
-            AND bm.date <= w.window_end
-        GROUP BY bm.mp, bm.seller, bm.sku, bm.article_1c, bm.code_1c, bm.cluster_to, bm.date
-        )
-
-        /* добавим проникновение и зону (по канону) */
-        , day_state_zoned AS (
-        SELECT
-            date, mp, seller, sku, article_1c, code_1c, cluster_to,
-            /* кэпим сверху и снизу */
-            greatest(0, least(available, bt))           AS eff_available,
-            if(bt > 0, (bt - greatest(0, least(available, bt))) / bt, NULL) AS pos,
-            multiIf(
-            bt <= 0 OR pos IS NULL,         NULL,
-            eff_available <= 0,             'black',
-            pos < 1.0/3.0,                  'green',
-            pos < 2.0/3.0,                  'yellow',
-                                            'red'
-            ) AS zone
-        FROM day_state
-        )
-
-        /* ---------- 4) Агрегация зон и покрытие по окну ---------- */
-        , cov AS (
-        SELECT
-            w.mp as mp, w.seller as seller, w.sku as sku, w.article_1c as article_1c, w.code_1c as code_1c, w.cluster_to as cluster_to,
-            w.window_start as window_start, w.window_end as window_end,
-            countIf(dsz.zone IS NOT NULL)                            AS days_observed,
-            sum(dsz.zone = 'black')                                  AS breach_days,
-            sum(dsz.zone = 'red')                                    AS red_days,
-            sum(dsz.zone = 'green')                                  AS green_days,
-            sum(dsz.zone = 'yellow')                                 AS yellow_days,
-            /* пороги от наблюдаемых */
-            greatest(1, toUInt32(ceil(days_observed * RED_SHARE_UP)))    AS red_threshold,
-            toUInt32(floor(days_observed * GREEN_SHARE_DOWN))             AS green_threshold,
-            /* требование покрытия от календаря */
-            (days_observed >=
-            toUInt32(round((dateDiff('day', w.window_start, w.window_end) + 1) * REQUIRE_COVERAGE))) AS has_coverage
-        FROM win w
-        LEFT JOIN day_state_zoned dsz
-            ON  dsz.mp = w.mp AND dsz.seller = w.seller AND dsz.sku = w.sku
-            AND dsz.article_1c = w.article_1c AND dsz.code_1c = w.code_1c
-            AND dsz.cluster_to = w.cluster_to
-        WHERE (dsz.date BETWEEN w.window_start AND w.window_end) OR (dsz.date IS NULL)
-        GROUP BY w.mp, w.seller, w.sku, w.article_1c, w.code_1c, w.cluster_to, w.window_start, w.window_end
-        )
-
-        /* ---------- 5) Быстрый триггер: N последних дней подряд — 'red' ---------- */
-        , fast_tail AS (
-            SELECT
-                z.mp as mp,
-                z.seller as seller,
-                z.sku as sku,
-                z.article_1c as article_1c,
-                z.code_1c as code_1c,
-                z.cluster_to as cluster_to,
-                arrayMap(p -> p.2, arraySort(groupArray((z.date, z.zone)))) AS arr_zones,
-                /* если наблюдений меньше N — 0; иначе проверяем, что последние N дней = 'red' */
-                if(
-                    length(arr_zones) < toUInt32(FAST_RED_STREAK),
-                    toUInt8(0),
-                    toUInt8(
-                        arrayAll(x -> x = 'red',
-                                arraySlice(arr_zones, -toUInt32(FAST_RED_STREAK), toUInt32(FAST_RED_STREAK)))
-                    )
-                ) AS fast_red_all_lastN
-            FROM (
+            /* есть ли ХОТЬ КАКАЯ история по текущей версии ДО D (а не только на D-1) - в дальнейшем должно быть синхронизировано с SUSPEND */
+            , hist_before_today AS (
                 SELECT
-                    dsz.date,
-                    dsz.mp, dsz.seller, dsz.sku, dsz.article_1c, dsz.code_1c, dsz.cluster_to,
-                    dsz.zone
-                FROM day_state_zoned AS dsz
-                INNER JOIN win AS w
-                    ON  dsz.mp = w.mp AND dsz.seller = w.seller AND dsz.sku = w.sku
-                    AND dsz.article_1c = w.article_1c AND dsz.code_1c = w.code_1c
-                    AND dsz.cluster_to = w.cluster_to
-                WHERE dsz.date >= w.window_start AND dsz.date <= w.window_end
-            ) AS z
-            GROUP BY z.mp, z.seller, z.sku, z.article_1c, z.code_1c, z.cluster_to
-        )
+                    mp, seller, sku, article_1c, code_1c, cluster_to,
+                    count() AS cnt_hist
+                FROM sb.buffer_main
+                WHERE date < toDate('{START_DATE}')
+                AND id_ver = CUR_VER
+                GROUP BY mp, seller, sku, article_1c, code_1c, cluster_to
+            )
 
-        /* ---------- 6) Итог: решение ДУБ и маршрутизация ---------- */
-        SELECT
-            toDate('{START_DATE}') AS date,
-            kt.mp AS mp,
-            kt.seller AS seller,
-            kt.sku AS sku,
-            kt.article_1c AS article_1c,
-            kt.code_1c AS code_1c, 
-            kt.cluster_to AS cluster_to,
+            /* состояние на D-1 */
+            , prev_state AS (
+                SELECT
+                    mp, seller, sku, article_1c, code_1c, cluster_to,
+                    max(toInt16(new_buffer))   AS new_buffer_prev,
+                    max(buffer_cluster)        AS bt_prev,
+                    max(quantity_stocks)       AS stocks_prev
+                FROM sb.buffer_main
+                WHERE date = toDate('{START_DATE}') - INTERVAL 1 DAY
+                AND id_ver = CUR_VER
+                GROUP BY mp, seller, sku, article_1c, code_1c, cluster_to
+            )
 
-            /* action_suggested без фикса поставок */
-            multiIf(
-                cv.has_coverage = 0,                                  'HOLD',
-                ifNull(ft.fast_red_all_lastN, 0) = 1,                 'UP',
-                cv.red_days >= cv.red_threshold,                      'UP',
-                (cv.breach_days = 0 AND cv.red_days = 0
-                    AND cv.green_days >= cv.green_threshold),         'DOWN',
-                                                                    'HOLD'
-            ) AS action_raw,
+            , supplies_within_rt_keys AS (
+                SELECT
+                    s.mp as mp, s.seller as seller, s.sku as sku, s.article_1c as article_1c, s.code_1c as code_1c, s.cluster_to as cluster_to,
+                    SUM(s.quantity_supplies) AS quantity_supplies_within_rt
+                FROM sb.buffer_supplies s
+                INNER JOIN keys_today kt
+                    USING (mp, seller, sku, article_1c, code_1c, cluster_to)
+                WHERE s.id_ver = toString(CUR_VER)
+                /* поставки, чей closing_date попадает в (D; D+RT] */
+                AND s.closing_date >  toDate('{START_DATE}')
+                AND s.closing_date <= addDays(toDate('{START_DATE}'), RT_DEFAULT)
+                GROUP BY s.mp, s.seller, s.sku, s.article_1c, s.code_1c, s.cluster_to
+            )
 
-            /* итоговое действие с предохранителями */
-            multiIf(
-                -- 1) есть поставки в пределах RT → удерживаем вместо UP
-                (
-                action_raw = 'UP' AND ifNull(
-                        least((toFloat64(ifNull(p.stocks_prev, 0)) + ifNull(swk.quantity_supplies_within_rt, 0))
-                        / nullIf(toFloat64(ifNull(p.bt_prev, 0)), 0),
-                        1),0) >= 0.5), 'HOLD',
-                -- 2) кулдаун < RECALC_COOLDOWN_DAYS с последнего изменения буфера
-                (action_raw IN ('UP','DOWN'))
-                AND (ifNull(p.new_buffer_prev, 9999) < toUInt32(RECALC_COOLDOWN_DAYS))
-                AND NOT (action_raw = 'UP' AND (
-                            ifNull(ft.fast_red_all_lastN, 0) = 1
-                            OR cv.breach_days > 0
-                            OR cv.red_days >= cv.red_threshold
-                        )),
-                'HOLD',
+            /* ---------- 2) Окно ДУБ: необходимо в отдельном CTE, т.к. дальше будет разное кол-во дней окна на разные ключи ---------- */
+            , win AS (
+                SELECT
+                    mp, seller, sku, article_1c, code_1c, cluster_to,
+                    RT_DEFAULT                                    AS rt_days,
+                    toDate('{START_DATE}') - 1                    AS window_end,
+                    addDays(toDate('{START_DATE}') - 1, -(RT_DEFAULT * M_RT) + 1) AS window_start,
+                    CUR_VER                                       AS id_ver 
+                FROM keys_today kt
+            )
 
-                -- else
-                action_raw
-            ) AS action_suggested,
+            /* ---------- 3) День-стейт из sb.buffer_main за окно ---------- */
+            , day_state AS (
+            SELECT
+                bm.date AS date, bm.mp as mp, bm.seller as seller, bm.sku as sku, bm.article_1c as article_1c, bm.code_1c as code_1c, bm.cluster_to as cluster_to,
+                toInt64(argMax(buffer_cluster, bm.date))     AS bt,
+                toInt64(argMax(quantity_stocks, bm.date))    AS available   -- только склад
+            FROM sb.buffer_main bm
+            INNER JOIN win w
+                ON bm.mp = w.mp AND bm.seller = w.seller AND bm.sku = w.sku
+            AND bm.article_1c = w.article_1c AND bm.code_1c = w.code_1c
+            AND bm.cluster_to = w.cluster_to
+            WHERE bm.id_ver = CUR_VER
+                AND bm.date >= w.window_start
+                AND bm.date <= w.window_end
+            GROUP BY bm.mp, bm.seller, bm.sku, bm.article_1c, bm.code_1c, bm.cluster_to, bm.date
+            )
 
-            /* приоритет: нет истории → first_init; есть сигнал → recalc; иначе simulate */
-            multiIf(
-                hist.cnt_hist IS NULL OR hist.cnt_hist = 0,           'first_init',
-                (action_suggested IN ('UP','DOWN')),                  'recalc_day',
-                                                                    'simulate_day'
-            ) AS calc_type,
-            p.new_buffer_prev AS new_buffer_prev,
-            CAST(hist.cnt_hist IS NULL OR hist.cnt_hist = 0 AS UInt8) AS is_first_day,
-            CAST((action_suggested IN ('UP','DOWN')) AS UInt8)         AS is_recalc_day,
-            CAST(CUR_VER AS UInt8)                                     AS id_ver
+            /* добавим проникновение и зону (по канону) */
+            , day_state_zoned AS (
+            SELECT
+                date, mp, seller, sku, article_1c, code_1c, cluster_to,
+                /* кэпим сверху и снизу */
+                greatest(0, least(available, bt))           AS eff_available,
+                if(bt > 0, (bt - greatest(0, least(available, bt))) / bt, NULL) AS pos,
+                multiIf(
+                bt <= 0 OR pos IS NULL,         NULL,
+                eff_available <= 0,             'black',
+                pos < 1.0/3.0,                  'green',
+                pos < 2.0/3.0,                  'yellow',
+                                                'red'
+                ) AS zone
+            FROM day_state
+            )
 
-        FROM keys_today kt
-        INNER JOIN valid_articles va
-        USING (article_1c, code_1c, sku, mp)
+            /* ---------- 4) Агрегация зон и покрытие по окну ---------- */
+            , cov AS (
+            SELECT
+                w.mp as mp, w.seller as seller, w.sku as sku, w.article_1c as article_1c, w.code_1c as code_1c, w.cluster_to as cluster_to,
+                w.window_start as window_start, w.window_end as window_end,
+                countIf(dsz.zone IS NOT NULL)                            AS days_observed,
+                sum(dsz.zone = 'black')                                  AS breach_days,
+                sum(dsz.zone = 'red')                                    AS red_days,
+                sum(dsz.zone = 'green')                                  AS green_days,
+                sum(dsz.zone = 'yellow')                                 AS yellow_days,
+                /* пороги от наблюдаемых */
+                greatest(1, toUInt32(ceil(days_observed * RED_SHARE_UP)))    AS red_threshold,
+                toUInt32(floor(days_observed * GREEN_SHARE_DOWN))             AS green_threshold,
+                /* требование покрытия от календаря */
+                (days_observed >=
+                toUInt32(round((dateDiff('day', w.window_start, w.window_end) + 1) * REQUIRE_COVERAGE))) AS has_coverage
+            FROM win w
+            LEFT JOIN day_state_zoned dsz
+                ON  dsz.mp = w.mp AND dsz.seller = w.seller AND dsz.sku = w.sku
+                AND dsz.article_1c = w.article_1c AND dsz.code_1c = w.code_1c
+                AND dsz.cluster_to = w.cluster_to
+            WHERE (dsz.date BETWEEN w.window_start AND w.window_end) OR (dsz.date IS NULL)
+            GROUP BY w.mp, w.seller, w.sku, w.article_1c, w.code_1c, w.cluster_to, w.window_start, w.window_end
+            )
 
-        LEFT JOIN hist_before_today AS hist
-        USING (mp, seller, sku, article_1c, code_1c, cluster_to)
+            /* ---------- 5) Быстрый триггер: N последних дней подряд — 'red' ---------- */
+            , fast_tail AS (
+                SELECT
+                    z.mp as mp,
+                    z.seller as seller,
+                    z.sku as sku,
+                    z.article_1c as article_1c,
+                    z.code_1c as code_1c,
+                    z.cluster_to as cluster_to,
+                    arrayMap(p -> p.2, arraySort(groupArray((z.date, z.zone)))) AS arr_zones,
+                    /* если наблюдений меньше N — 0; иначе проверяем, что последние N дней = 'red' */
+                    if(
+                        length(arr_zones) < toUInt32(FAST_RED_STREAK),
+                        toUInt8(0),
+                        toUInt8(
+                            arrayAll(x -> x = 'red',
+                                    arraySlice(arr_zones, -toUInt32(FAST_RED_STREAK), toUInt32(FAST_RED_STREAK)))
+                        )
+                    ) AS fast_red_all_lastN
+                FROM (
+                    SELECT
+                        dsz.date,
+                        dsz.mp, dsz.seller, dsz.sku, dsz.article_1c, dsz.code_1c, dsz.cluster_to,
+                        dsz.zone
+                    FROM day_state_zoned AS dsz
+                    INNER JOIN win AS w
+                        ON  dsz.mp = w.mp AND dsz.seller = w.seller AND dsz.sku = w.sku
+                        AND dsz.article_1c = w.article_1c AND dsz.code_1c = w.code_1c
+                        AND dsz.cluster_to = w.cluster_to
+                    WHERE dsz.date >= w.window_start AND dsz.date <= w.window_end
+                ) AS z
+                GROUP BY z.mp, z.seller, z.sku, z.article_1c, z.code_1c, z.cluster_to
+            )
 
-        LEFT JOIN prev_state AS p
-        USING (mp, seller, sku, article_1c, code_1c, cluster_to)
 
-        LEFT JOIN cov AS cv
-        USING (mp, seller, sku, article_1c, code_1c, cluster_to)
+            /* --- Календарь окна per-key (полный набор дат в [window_start; window_end]) --- */
+            , cal_win AS (
+                SELECT
+                    addDays(w.window_start, offs) AS date,
+                    w.mp, w.seller, w.sku, w.article_1c, w.code_1c, w.cluster_to,
+                    w.rt_days,
+                    w.id_ver
+                FROM win AS w
+                ARRAY JOIN range(dateDiff('day', w.window_start, w.window_end) + 1) AS offs
+            )
 
-        LEFT JOIN fast_tail AS ft
-        USING (mp, seller, sku, article_1c, code_1c, cluster_to)
 
-        LEFT JOIN supplies_within_rt_keys swk
-        USING (mp, seller, sku, article_1c, code_1c, cluster_to)
+            /* --- Заказы по календарю (недостающие дни → 0) --- */
+            , sales_on_cal AS (
+                SELECT
+                    c.date,
+                    c.mp, c.seller, c.sku, c.article_1c, c.code_1c, c.cluster_to,
+                    c.id_ver,                                            -- ← добавили
+                    toFloat64(ifNull(sum(s.quantity_orders), 0)) AS qty,
+                    c.rt_days
+                FROM cal_win c
+                LEFT JOIN kpi.all_mp_sales_wsb s
+                ON s.date = c.date
+                AND s.mp = c.mp AND s.seller = c.seller AND s.sku = c.sku
+                AND s.article_1c = c.article_1c AND s.code_1c = c.code_1c
+                AND s.cluster_to = c.cluster_to
+                GROUP BY
+                    c.date, c.mp, c.seller, c.sku, c.article_1c, c.code_1c, c.cluster_to, c.id_ver, c.rt_days
+            )
 
 
-        GROUP BY
-            date, mp, seller, sku, article_1c, code_1c, cluster_to,
-            action_suggested, calc_type, cv.has_coverage, ft.fast_red_all_lastN, cv.red_days, cv.red_threshold, cv.breach_days, cv.green_days, cv.green_threshold,
-            new_buffer_prev, is_first_day, is_recalc_day, id_ver
-            '''     
+            /* --- «Правильное среднее» и целевые буферы --- */
+            , demand_calc AS (
+                SELECT
+                    mp, seller, sku, article_1c, code_1c, cluster_to,
+                    id_ver,                                             -- ← добавили
+
+                    groupArray((date, qty))                      AS pairs,   -- исправляем ошибку ORDER BY date) 
+                    arrayMap(t -> t.2, arraySort(pairs))         AS arr,     -- теперь arr упорядочен по дате по возрастанию
+
+                    length(arr)                                     AS n,
+                    arraySort(arr)                                  AS arr_sorted,
+                    ((n - 1) * CAP_Q)                               AS kk,
+                    toInt64(floor(kk))                              AS f,
+                    toInt64(ceil(kk))                               AS c,
+                    (kk - f)                                        AS frac,
+                    if(n = 0, 0.0,
+                    if(f = c, arr_sorted[f + 1],
+                        arr_sorted[f + 1] * (1 - frac) + arr_sorted[c + 1] * frac
+                    ))                                              AS p90_win,
+
+                    arrayMap(v -> if(v > p90_win, p90_win, v), arr) AS arr_cap,
+
+                    length(arr_cap)                                 AS n_cap,
+                    arrayReverse(arr_cap)                           AS rev,
+                    arrayMap(i -> pow(1 - ALPHA, i - 1), arrayEnumerate(rev)) AS geom,
+                    (1 - pow(1 - ALPHA, n_cap))                     AS wnorm,
+                    if(n_cap = 0, 0.0,
+                    arraySum(arrayMap((v, w) -> v * w, rev, geom)) * (ALPHA / nullIf(wnorm, 0))
+                    )                                       AS avg_qty_ewma,
+                    arrayAvg(arr_cap)                       AS m_cap,
+                    if(n_cap = 0, 0.0,
+                    arrayAvg(arrayMap(v -> v * v, arr_cap)) - m_cap * m_cap
+                    )                                       AS s2_cap,
+                    anyLast(rt_days)                                AS RTd,
+                    sqrt(greatest(0.0, s2_cap) * RTd)              AS sigmaH,
+                    (avg_qty_ewma * RTd + Z * sigmaH)              AS B_base,
+
+                    ROUND(B_base * B_MULT + avg_qty_ewma * B_EXTRA_DAYS) AS buf_target_toc,
+                    ROUND(toFloat64({PARAMS['AVG_DAYS_CONST']}) * toFloat64({PARAMS['M_RT']}) * avg_qty_ewma) AS buf_target_norm
+                FROM sales_on_cal
+                GROUP BY mp, seller, sku, article_1c, code_1c, cluster_to, id_ver   -- ← добавили id_ver
+            )
+
+
+            /* ---------- 6) Итог: решение ДУБ и маршрутизация ---------- */
+            SELECT
+                toDate('{START_DATE}') AS date,
+                kt.mp AS mp,
+                kt.seller AS seller,
+                kt.sku AS sku,
+                kt.article_1c AS article_1c,
+                kt.code_1c AS code_1c, 
+                kt.cluster_to AS cluster_to,
+
+                /* action_suggested без фикса поставок */
+                multiIf(
+                    cv.has_coverage = 0,                                  'HOLD',
+                    ifNull(ft.fast_red_all_lastN, 0) = 1,                 'UP',
+                    cv.red_days >= cv.red_threshold,                      'UP',
+                    (cv.breach_days = 0 AND cv.red_days = 0
+                        AND cv.green_days >= cv.green_threshold),         'DOWN',
+                                                                        'HOLD'
+                ) AS action_raw,
+
+                /* итоговое действие с предохранителями */
+                multiIf(
+                    -- 1) есть поставки в пределах RT → удерживаем вместо UP
+                    (
+                    action_raw = 'UP' AND ifNull(
+                            least((toFloat64(ifNull(p.stocks_prev, 0)) + ifNull(swk.quantity_supplies_within_rt, 0))
+                            / nullIf(toFloat64(ifNull(p.bt_prev, 0)), 0),
+                            1),0) >= 0.5), 'HOLD',
+                    -- 2) кулдаун < RECALC_COOLDOWN_DAYS с последнего изменения буфера
+                    (action_raw IN ('UP','DOWN'))
+                    AND (ifNull(p.new_buffer_prev, 9999) < toUInt32(RECALC_COOLDOWN_DAYS))
+                    AND NOT (action_raw = 'UP' AND (
+                                ifNull(ft.fast_red_all_lastN, 0) = 1
+                                OR cv.breach_days > 0
+                                OR cv.red_days >= cv.red_threshold
+                            )),
+                    'HOLD',
+
+                    -- else
+                    action_raw
+                ) AS action_suggested,
+
+                dc.buf_target_toc                                 AS min_buffer,
+
+                /* приоритет: нет истории → first_init; есть сигнал → recalc; иначе simulate */
+                multiIf(
+                    hist.cnt_hist IS NULL OR hist.cnt_hist = 0,           'first_init',
+                    (action_suggested IN ('UP','DOWN')),                  'recalc_day',
+                                                                        'simulate_day'
+                ) AS calc_type,
+                p.new_buffer_prev AS new_buffer_prev,
+                CAST(hist.cnt_hist IS NULL OR hist.cnt_hist = 0 AS UInt8) AS is_first_day,
+                CAST((action_suggested IN ('UP','DOWN')) AS UInt8)         AS is_recalc_day,
+                CAST(CUR_VER AS UInt8)                                     AS id_ver,
+
+                /* -------- Новые подсказки по буферу (из demand_calc) -------- */
+                dc.avg_qty_ewma                                         AS avg_qty_ewma,
+                round(dc.buf_target_toc)                                 AS buf_target_toc,
+
+                /* мультипликаторы к вчерашнему буферу */
+                ifNull(dc.buf_target_norm / nullIf(toFloat64(p.bt_prev), 0), NULL) AS rec_mult_norm,
+                ifNull(dc.buf_target_toc  / nullIf(toFloat64(p.bt_prev), 0), NULL) AS rec_mult_toc,
+
+                /* мягкие советы: сравнение с bt_prev в допуске ±ADVICE_TOL */
+                multiIf(rec_mult_norm IS NULL, 'HOLD',
+                        rec_mult_norm > 1 + ADVICE_TOL, 'UP',
+                        rec_mult_norm < 1 - ADVICE_TOL, 'DOWN',
+                        'HOLD')                                                  AS advice_norm,
+
+                multiIf(rec_mult_toc IS NULL, 'HOLD',
+                        rec_mult_toc > 1 + ADVICE_TOL, 'UP',
+                        rec_mult_toc < 1 - ADVICE_TOL, 'DOWN',
+                        'HOLD')                                                  AS advice_toc
+
+            FROM keys_today kt
+            INNER JOIN valid_articles va
+            USING (article_1c, code_1c, sku, mp)
+
+            LEFT JOIN hist_before_today AS hist
+            USING (mp, seller, sku, article_1c, code_1c, cluster_to)
+
+            LEFT JOIN prev_state AS p
+            USING (mp, seller, sku, article_1c, code_1c, cluster_to)
+
+            LEFT JOIN cov AS cv
+            USING (mp, seller, sku, article_1c, code_1c, cluster_to)
+
+            LEFT JOIN fast_tail AS ft
+            USING (mp, seller, sku, article_1c, code_1c, cluster_to)
+
+            LEFT JOIN supplies_within_rt_keys swk
+            USING (mp, seller, sku, article_1c, code_1c, cluster_to)
+
+            /* === Новый JOIN: рекомендации на основе спроса и целевых буферов === */
+            LEFT JOIN demand_calc AS dc
+            ON  dc.id_ver     = CUR_VER
+            AND dc.mp         = kt.mp
+            AND dc.seller     = kt.seller
+            AND dc.sku        = kt.sku
+            AND dc.article_1c = kt.article_1c
+            AND dc.code_1c    = kt.code_1c
+            AND dc.cluster_to = kt.cluster_to
+
+            /* Если у тебя не требуется дедупликация, GROUP BY можно опустить.
+            Если оставляешь как раньше — добавь новые поля в GROUP BY: */
+            GROUP BY
+                date, mp, seller, sku, article_1c, code_1c, cluster_to,
+                action_suggested, calc_type, cv.has_coverage, ft.fast_red_all_lastN, cv.red_days, cv.red_threshold, cv.breach_days, cv.green_days, cv.green_threshold,
+                new_buffer_prev, is_first_day, is_recalc_day, id_ver,
+                /* Новые поля из demand_calc */
+                avg_qty_ewma, dc.buf_target_norm, dc.buf_target_toc,
+                rec_mult_norm, rec_mult_toc, advice_norm, advice_toc
+        '''    
     df_keys = ch_object.extract_data(query_keys)
     df_keys, other_column_list = preprocess_data(df=df_keys, column_types=TYPES_KEYS, add_missed_columns=False, handle_invalid_values=False)
     ch_object.execute_query(query=f'''DELETE FROM sb.buffer_calc_keys WHERE id_ver = toInt32({PARAMS['id_ver']}) AND date = '{START_DATE}'  ''')
@@ -622,14 +748,14 @@ for date in date_range:
     , final_full AS (
         SELECT
             am.mp AS mp, am.seller AS seller, am.sku AS sku, am.article_1c AS article_1c, am.code_1c AS code_1c, am.cluster_to AS cluster_to,
-            don.days_oos_number, bp.days_bp_number,
-            smp.quantity_stocks,
-            smp.quantity_stocks_full,
-            src.quantity_stocks_main,
-            src.quantity_stocks_main_full,
-            sup.quantity_supplies,            
-            swr.quantity_supplies_within_rt,    
-            bp.bp_quantity_orders,
+            don.days_oos_number as days_oos_number, bp.days_bp_number as days_bp_number,
+            smp.quantity_stocks as quantity_stocks,
+            smp.quantity_stocks_full as quantity_stocks_full,
+            src.quantity_stocks_main as quantity_stocks_main,
+            src.quantity_stocks_main_full as quantity_stocks_main_full,
+            sup.quantity_supplies as quantity_supplies,            
+            swr.quantity_supplies_within_rt as quantity_supplies_within_rt,    
+            bp.bp_quantity_orders as bp_quantity_orders,
             MAX(am.quantity_orders) AS max_quantity_order,
             MIN(am.quantity_orders) AS min_quantity_order,
             SUM(am.quantity_orders) AS total_quantity_orders_full,
@@ -737,7 +863,7 @@ for date in date_range:
         ROUND(
         LEAST(
             IFNULL(
-            (st.quantity_stocks + ifNull(swr.quantity_supplies_within_rt, 0))
+            (ff.quantity_stocks + ifNull(ff.quantity_supplies_within_rt, 0))
             / NULLIF(buffer_cluster, 0),
             1
             ),
@@ -755,10 +881,10 @@ for date in date_range:
         multiIf(ifNull(quantity_stocks, 0) <= 0, 0, ifNull(oos.quantity_orders, 0)) AS quantity_orders,
         quantity_stocks                 AS quantity_stocks,
         quantity_supplies                 AS quantity_supplies,
-        ifNull(quantity_supplies_within_rt, 0) AS quantity_supplies_within_rt,
+        ifNull(ff.quantity_supplies_within_rt, 0) AS quantity_supplies_within_rt,
         0                                 AS new_buffer
 
-    FROM final_full
+    FROM final_full ff
     LEFT JOIN final_exclude oos USING (mp, seller, sku, article_1c, code_1c, cluster_to)
     LEFT JOIN (
         SELECT DISTINCT name, article_1c, code_1c
@@ -1098,8 +1224,8 @@ for date in date_range:
             ps.mp as mp, ps.seller as seller, ps.sku as sku, ps.article_1c as article_1c, ps.code_1c as code_1c, ps.cluster_to as cluster_to,
             ROUND(
                 greatest(
-                    toFloat64(ps.buffer_cluster_prev) * ifNull(ffa.factor_final, 1.0),
-                    ffa.min_buffer
+                    toInt64(ps.buffer_cluster_prev) * toInt64(ifNull(ffa.factor_final, 1.0)),
+                    toInt64(ffa.min_buffer)
                 )
             ) AS buffer_cluster_new
         FROM prev_state ps
