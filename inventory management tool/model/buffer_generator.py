@@ -22,6 +22,7 @@ TYPES_KEYS = {
         'cluster_to': 'string',
         'calc_type': 'string',
         'action_suggested': 'string',
+        'min_buffer': 'int64',
         'new_buffer_prev': 'int64',
         'is_first_day':'int64',
         'is_recalc_day':'int64',
