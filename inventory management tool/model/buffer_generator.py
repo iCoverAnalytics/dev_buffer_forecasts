@@ -734,12 +734,18 @@ for date in date_range:
                 - ifNull(quantity_supplies, 0))
         ) AS deliveries_to_cluster,
 
+        ROUND(
+        LEAST(
+            IFNULL(
+            (st.quantity_stocks + ifNull(swr.quantity_supplies_within_rt, 0))
+            / NULLIF(buffer_cluster, 0),
+            1
+            ),
+            1
+        ),
+        2
+        ) AS buffer_cluster_marker_current,
 
-        -- DBM «текущий» = только OnHand / BT
-        ROUND(LEAST(
-            IFNULL( quantity_stocks
-                    / NULLIF(BUF_NORM_CONST*avg_quantity_orders, 0), 1),
-            1), 2) AS buffer_cluster_marker_current,
 
         -- «pipeline»-маркер оставляем как операционный (OnHand + все in-transit)
         ROUND(LEAST(
@@ -922,8 +928,16 @@ for date in date_range:
 
         /* маркер ТЕКУЩИЙ по DBM: только OnHand/BT */
         ROUND(
-        LEAST(IFNULL(st.quantity_stocks / NULLIF(buffer_cluster, 0), 1), 1)
-        , 2) AS buffer_cluster_marker_current,
+        LEAST(
+            IFNULL(
+            (st.quantity_stocks + ifNull(swr.quantity_supplies_within_rt, 0))
+            / NULLIF(buffer_cluster, 0),
+            1
+            ),
+            1
+        ),
+        2
+        ) AS buffer_cluster_marker_current,
 
         ROUND(
         LEAST(
@@ -1126,10 +1140,15 @@ for date in date_range:
         ) AS deliveries_to_cluster,
 
         ROUND(
-            LEAST(
-                IFNULL(st.quantity_stocks / NULLIF(bn.buffer_cluster_new, 0), 1),
-                1
-            ), 2
+        LEAST(
+            IFNULL(
+            (st.quantity_stocks + ifNull(swr.quantity_supplies_within_rt, 0))
+            / NULLIF(bn.buffer_cluster_new, 0),
+            1
+            ),
+            1
+        ),
+        2
         ) AS buffer_cluster_marker_current,
 
         ROUND(
