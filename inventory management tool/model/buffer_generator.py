@@ -74,7 +74,7 @@ TYPES_SUP = {
 
 PARAMS = {
     # --- Служебные (в т.ч. для формирования первичного буфера) ---   
-    'id_ver': 4,                 # версия расчёта 
+    'id_ver': 1,                 # версия расчёта 
     'PERIOD': 30,                 # окно истории продаж для расчётов (дни) - используется для init day и используется в т.ч. (пока нет товарной матрицы) для определения пула на расчета буфера
     'AVG_DAYS_CONST': 7,          # дефолтный RT (дней), пока нет фактического по ключу
     'OOS_RATIO': 0.02,            # порог "низкий запас" (для аналитики/отчетов, не влияет на ДУБ)
@@ -131,7 +131,7 @@ volumes = volumes.astype({'volume_m3': 'float'})
 volumes.info()
 
 
-date_range = pd.date_range(start='2025-02-01', end='2025-05-01')
+date_range = pd.date_range(start='2025-02-01', end='2025-08-01')
 
 for date in date_range:
     # Преобразуем Timestamp в строку формата 'YYYY-MM-DD'
@@ -422,12 +422,14 @@ for date in date_range:
 
                 /* action_suggested без фикса поставок */
                 multiIf(
-                    cv.has_coverage = 0,                                  'HOLD',
-                    ifNull(ft.fast_red_all_lastN, 0) = 1,                 'UP',
-                    cv.red_days >= cv.red_threshold,                      'UP',
+                    cv.has_coverage = 0,                              'HOLD',
+                    ifNull(ft.fast_red_all_lastN, 0) = 1,             'UP',
+                    /* НОВОЕ: любой «прокол» в окне → UP */
+                    cv.breach_days > 0,                               'UP',
+                    cv.red_days >= cv.red_threshold,                  'UP',
                     (cv.breach_days = 0 AND cv.red_days = 0
-                        AND cv.green_days >= cv.green_threshold),         'DOWN',
-                                                                        'HOLD'
+                        AND cv.green_days >= cv.green_threshold),     'DOWN',
+                                                                    'HOLD'
                 ) AS action_raw,
 
                 /* итоговое действие с предохранителями */
@@ -524,7 +526,7 @@ for date in date_range:
                 rec_mult_norm, rec_mult_toc, advice_norm, advice_toc
         '''    
     df_keys = ch_object.extract_data(query_keys)
-    df_keys, other_column_list = preprocess_data(df=df_keys, column_types=TYPES_KEYS, add_missed_columns=False, handle_invalid_values=False)
+    df_keys, other_column_list = preprocess_data(df=df_keys, column_types=TYPES_KEYS, add_missed_columns=True, handle_invalid_values=False)
     ch_object.execute_query(query=f'''DELETE FROM sb.buffer_calc_keys WHERE id_ver = toInt32({PARAMS['id_ver']}) AND date = '{START_DATE}'  ''')
     ch_object.insert_data(table_name='sb.buffer_calc_keys', df=df_keys)
     # Наполняем buffer_main
@@ -897,7 +899,7 @@ for date in date_range:
 
     '''
     df_init = ch_object.extract_data(query_init)
-    df_init, other_column_list = preprocess_data(df=df_init, column_types=TYPES, add_missed_columns=False, handle_invalid_values=False)
+    df_init, other_column_list = preprocess_data(df=df_init, column_types=TYPES, add_missed_columns=True, handle_invalid_values=False)
     ch_object.insert_data(table_name='sb.buffer_main', df=df_init)
 
     # Симуляция
@@ -1393,7 +1395,14 @@ for date in date_range:
         # print(f"Объем итоговый поставки: {free_left}")
 
         # Идём по товарам в порядке убывания приоритета (нашего светофора)
-        for _, row in wh_items.sort_values('buffer_cluster_marker', ascending=False).iterrows():
+        # for _, row in wh_items.sort_values('buffer_cluster_marker', ascending=False).iterrows():
+        wh_items['__breach_today__'] = (wh_items['quantity_stocks'] <= 0).astype(int)
+
+        # приоритет: прокол → низкий текущий маркер → низкий pipeline → большая потребность
+        sort_cols = ['__breach_today__', 'buffer_cluster_marker_current', 'buffer_cluster_marker', 'deliveries_to_cluster']
+        sort_asc  = [False, True, True, False]
+
+        for _, row in wh_items.sort_values(by=sort_cols, ascending=sort_asc).iterrows():
             # vol = row['volume_requirement']
 
             # Базовый словарь параметров
