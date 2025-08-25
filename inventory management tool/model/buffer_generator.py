@@ -74,7 +74,7 @@ TYPES_SUP = {
 
 PARAMS = {
     # --- Служебные (в т.ч. для формирования первичного буфера) ---   
-    'id_ver': 1,                 # версия расчёта 
+    'id_ver': 2,                 # версия расчёта 
     'PERIOD': 30,                 # окно истории продаж для расчётов (дни) - используется для init day и используется в т.ч. (пока нет товарной матрицы) для определения пула на расчета буфера
     'AVG_DAYS_CONST': 7,          # дефолтный RT (дней), пока нет фактического по ключу
     'OOS_RATIO': 0.02,            # порог "низкий запас" (для аналитики/отчетов, не влияет на ДУБ)
@@ -113,7 +113,6 @@ PARAMS = {
     # 'SUSPEND_TTL_DAYS': 30,
     # 'SUSPEND_AUTORELEASE_DAYS': 3,
 
-    # --- Советы диванного GPG ---
     'Z'               : 2.33,
     'B_MULT'          : 1.0,            # ручное увеличение буфера (множитель)
     'B_EXTRA_DAYS'    : 0,              # дни покрытия сверху
@@ -422,31 +421,38 @@ for date in date_range:
 
                 /* action_suggested без фикса поставок */
                 multiIf(
-                    cv.has_coverage = 0,                              'HOLD',
-                    ifNull(ft.fast_red_all_lastN, 0) = 1,             'UP',
-                    /* НОВОЕ: любой «прокол» в окне → UP */
-                    cv.breach_days > 0,                               'UP',
-                    cv.red_days >= cv.red_threshold,                  'UP',
+                    cv.has_coverage = 0,                                'HOLD',
+                    ifNull(ft.fast_red_all_lastN, 0) = 1,               'UP',
+                    dc.buf_target_toc > ifNull(p.bt_prev, 0),           'UP',
+                    cv.breach_days > 0,                                 'UP',
+                    cv.red_days >= cv.red_threshold,                    'UP',
                     (cv.breach_days = 0 AND cv.red_days = 0
-                        AND cv.green_days >= cv.green_threshold),     'DOWN',
-                                                                    'HOLD'
+                        AND cv.green_days >= cv.green_threshold),       'DOWN',
+                                                                        'HOLD'
                 ) AS action_raw,
 
                 /* итоговое действие с предохранителями */
                 multiIf(
                     -- 1) есть поставки в пределах RT → удерживаем вместо UP
                     (
-                    action_raw = 'UP' AND ifNull(
-                            least((toFloat64(ifNull(p.stocks_prev, 0)) + ifNull(swk.quantity_supplies_within_rt, 0))
+                    action_raw = 'UP'
+                    AND ifNull(
+                            least(
+                            (toFloat64(ifNull(p.stocks_prev, 0)) + ifNull(swk.quantity_supplies_within_rt, 0))
                             / nullIf(toFloat64(ifNull(p.bt_prev, 0)), 0),
-                            1),0) >= 0.5), 'HOLD',
+                            1
+                            ), 0
+                        ) >= 0.5
+                    AND NOT ( (dc.buf_target_toc > ifNull(p.bt_prev, 0)) OR (cv.breach_days > 0) )
+                    ), 'HOLD',
                     -- 2) кулдаун < RECALC_COOLDOWN_DAYS с последнего изменения буфера
                     (action_raw IN ('UP','DOWN'))
                     AND (ifNull(p.new_buffer_prev, 9999) < toUInt32(RECALC_COOLDOWN_DAYS))
                     AND NOT (action_raw = 'UP' AND (
-                                ifNull(ft.fast_red_all_lastN, 0) = 1
-                                OR cv.breach_days > 0
-                                OR cv.red_days >= cv.red_threshold
+                            ifNull(ft.fast_red_all_lastN, 0) = 1
+                            OR cv.breach_days > 0
+                            OR cv.red_days >= cv.red_threshold
+                            OR (dc.buf_target_toc > ifNull(p.bt_prev, 0))                       
                             )),
                     'HOLD',
 
@@ -523,7 +529,8 @@ for date in date_range:
                 new_buffer_prev, is_first_day, is_recalc_day, id_ver,
                 /* Новые поля из demand_calc */
                 avg_qty_ewma, dc.buf_target_norm, dc.buf_target_toc,
-                rec_mult_norm, rec_mult_toc, advice_norm, advice_toc
+                rec_mult_norm, rec_mult_toc, advice_norm, advice_toc,
+                p.bt_prev
         '''    
     df_keys = ch_object.extract_data(query_keys)
     df_keys, other_column_list = preprocess_data(df=df_keys, column_types=TYPES_KEYS, add_missed_columns=True, handle_invalid_values=False)
